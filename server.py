@@ -49,7 +49,21 @@ _PERSISTED_JOB_FIELDS = (
     "id", "filename", "job_dir", "upload_path", "sheets", "sheet", "row_count",
     "pilot_size", "status", "phase", "log", "error", "stats_pilot", "stats_full",
     "pilot_path", "full_path", "manifests_dir", "results_dir", "created_at",
+    "feedback_history",
 )
+
+
+def _combined_feedback(job: dict) -> str | None:
+    """Every round of pilot-review feedback the user has given so far,
+    threaded into later validate calls (both further pilot revisions AND the
+    eventual full run) so the full dataset gets the same adjusted behavior
+    the user actually approved, not the original unrefined rules."""
+    history = job.get("feedback_history") or []
+    if not history:
+        return None
+    if len(history) == 1:
+        return history[0]
+    return "\n\n".join(f"(Round {i + 1} feedback) {text}" for i, text in enumerate(history))
 
 
 def _log(job_id: str, message: str) -> None:
@@ -100,6 +114,7 @@ def _load_job_history() -> None:
             continue
         with open(meta_path, "r", encoding="utf-8") as f:
             job = json.load(f)
+        job.setdefault("feedback_history", [])  # older jobs predate this field
         if job.get("status") in ("pilot_running", "full_running"):
             job["status"] = "failed"
             job["phase"] = None
@@ -192,6 +207,7 @@ async def upload(file: UploadFile):
             "manifests_dir": os.path.join(job_dir, "manifests"),
             "results_dir": os.path.join(job_dir, "results"),
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "feedback_history": [],
             "_gemini_key": None,
             "_scrape_do_key": None,
             "_pilot_keys": None,
@@ -260,6 +276,7 @@ def _run_pilot(job_id: str) -> None:
                 manifests_dir=job["manifests_dir"], results_dir=job["results_dir"],
                 product_filter=lambda k, i: k in pilot_keys, gemini_key=job["_gemini_key"],
                 cache_dir=CACHE_DIR, log=lambda m: _log(job_id, m),
+                extra_instructions=_combined_feedback(job),
             )
 
             job["phase"] = "writeback"
@@ -274,9 +291,89 @@ def _run_pilot(job_id: str) -> None:
             job["pilot_path"] = os.path.join(job["job_dir"], "pilot_output.xlsx")
             job["status"] = "awaiting_approval"
             job["phase"] = None
-            _log(job_id, "Pilot complete - review the download, then approve to run the full batch")
+            _log(job_id, "Pilot complete - review the download, then approve or leave feedback to refine it")
         except Exception as e:
             _fail_job(job, job_id, "Pilot", e)
+        finally:
+            _save_job_meta(job)
+
+
+class FeedbackRequest(BaseModel):
+    feedback: str
+    scrape_do_key: str | None = None
+    gemini_key: str
+
+
+@app.post("/api/jobs/{job_id}/pilot/revise")
+def revise_pilot(job_id: str, body: FeedbackRequest):
+    feedback = body.feedback.strip()
+    if not feedback:
+        raise HTTPException(400, "Feedback text is required")
+
+    with _jobs_lock:
+        job = JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(404, "Job not found")
+        if job["status"] != "awaiting_approval":
+            raise HTTPException(400, f"Job is not awaiting approval (status={job['status']})")
+        if _run_lock.locked():
+            raise HTTPException(409, "Another run is already in progress - please wait for it to finish")
+        job.setdefault("feedback_history", []).append(feedback)
+        job["_gemini_key"] = body.gemini_key
+        job["_scrape_do_key"] = body.scrape_do_key or None
+        job["status"] = "pilot_running"
+
+    save_settings(body.scrape_do_key or None, body.gemini_key)
+    _save_job_meta(job)
+
+    threading.Thread(target=_run_pilot_revision, args=(job_id,), daemon=True).start()
+    return {"status": "started"}
+
+
+def _run_pilot_revision(job_id: str) -> None:
+    with _run_lock:
+        job = JOBS[job_id]
+        try:
+            # Recomputed from disk rather than trusted from an earlier
+            # in-memory value - the pilot fetch phase only ever wrote
+            # manifests for the pilot subset, so this is exactly the pilot's
+            # product set regardless of whether the server restarted in
+            # between (in-memory-only fields don't survive that).
+            pilot_keys = {
+                os.path.splitext(f)[0] for f in os.listdir(job["manifests_dir"]) if f.endswith(".json")
+            }
+            _log(job_id, f"Re-running the pilot on the same {len(pilot_keys)} products with your feedback")
+
+            # Drop the previous validation result for just these products so
+            # they're genuinely re-validated instead of skipped as "already done".
+            for key in pilot_keys:
+                result_path = os.path.join(job["results_dir"], f"{key}.json")
+                if os.path.exists(result_path):
+                    os.remove(result_path)
+
+            job["phase"] = "validate"
+            run_validate_phase(
+                manifests_dir=job["manifests_dir"], results_dir=job["results_dir"],
+                product_filter=lambda k, i: k in pilot_keys, gemini_key=job["_gemini_key"],
+                cache_dir=CACHE_DIR, log=lambda m: _log(job_id, m),
+                extra_instructions=_combined_feedback(job),
+            )
+
+            job["phase"] = "writeback"
+            stats = run_writeback_phase(
+                input_path=job["upload_path"],
+                output_path=os.path.join(job["job_dir"], "pilot_output.xlsx"),
+                results_dir=job["results_dir"], manifests_dir=job["manifests_dir"], sheet=job["sheet"],
+                product_keys=pilot_keys, log=lambda m: _log(job_id, m),
+            )
+
+            job["stats_pilot"] = stats
+            job["pilot_path"] = os.path.join(job["job_dir"], "pilot_output.xlsx")
+            job["status"] = "awaiting_approval"
+            job["phase"] = None
+            _log(job_id, "Revised pilot complete - review the download again, approve, or leave more feedback")
+        except Exception as e:
+            _fail_job(job, job_id, "Pilot revision", e)
         finally:
             _save_job_meta(job)
 
@@ -316,6 +413,7 @@ def _run_full(job_id: str) -> None:
                 manifests_dir=job["manifests_dir"], results_dir=job["results_dir"],
                 product_filter=all_filter, gemini_key=job["_gemini_key"],
                 cache_dir=CACHE_DIR, log=lambda m: _log(job_id, m),
+                extra_instructions=_combined_feedback(job),
             )
 
             job["phase"] = "writeback"
@@ -368,6 +466,7 @@ def get_job(job_id: str):
         "has_pilot_output": job["pilot_path"] is not None,
         "has_full_output": job["full_path"] is not None,
         "log": job["log"][-100:],
+        "feedback_history": job.get("feedback_history") or [],
     }
 
 

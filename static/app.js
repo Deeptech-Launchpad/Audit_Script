@@ -315,6 +315,38 @@ el("approve-btn").addEventListener("click", async () => {
   startPolling();
 });
 
+el("revise-btn").addEventListener("click", async () => {
+  const feedback = el("pilot-feedback").value.trim();
+  if (!feedback) {
+    el("pilot-feedback").focus();
+    return;
+  }
+  if (!savedSettings.gemini_key) {
+    alert("No Gemini key found - open Settings and save one first.");
+    return;
+  }
+  el("revise-btn").disabled = true;
+  const res = await fetch(`/api/jobs/${jobId}/pilot/revise`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      feedback,
+      scrape_do_key: savedSettings.scrape_do_key || null,
+      gemini_key: savedSettings.gemini_key,
+    }),
+  });
+  el("revise-btn").disabled = false;
+  if (!res.ok) {
+    alert((await res.json()).detail || "Could not re-run the pilot");
+    return;
+  }
+  el("pilot-feedback").value = "";
+  el("progress-title").textContent = "Re-running pilot with your feedback...";
+  el("log-box").textContent = "";
+  show("progress");
+  startPolling();
+});
+
 function startPolling() {
   clearInterval(pollTimer);
   pollTimer = setInterval(pollStatus, 2000);
@@ -361,6 +393,23 @@ function renderStats(container, stats) {
   }
 }
 
+function renderFeedbackHistory(history) {
+  const box = el("feedback-history");
+  const list = el("feedback-history-list");
+  if (!history || !history.length) {
+    box.classList.add("hidden");
+    list.innerHTML = "";
+    return;
+  }
+  list.innerHTML = "";
+  history.forEach((text) => {
+    const li = document.createElement("li");
+    li.textContent = text;
+    list.appendChild(li);
+  });
+  box.classList.remove("hidden");
+}
+
 function applyJobState(job) {
   el("progress-phase").textContent = job.phase ? `Phase: ${job.phase}` : "";
   el("log-box").textContent = (job.log || []).join("\n");
@@ -382,8 +431,11 @@ function applyJobState(job) {
   if (job.status === "awaiting_approval") {
     clearInterval(pollTimer);
     renderStats(el("pilot-stats"), job.stats_pilot);
+    renderFeedbackHistory(job.feedback_history);
     el("pilot-download").href = `/api/jobs/${jobId}/pilot/download`;
     el("approve-btn").disabled = false;
+    el("revise-btn").disabled = false;
+    el("pilot-feedback").value = "";
     show("approval");
     return;
   }

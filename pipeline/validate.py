@@ -148,9 +148,21 @@ def gather_sources_text(manifest):
     return texts, errors
 
 
-def build_prompt(manifest, texts, errors, cache_dir):
+def build_prompt(manifest, texts, errors, cache_dir, extra_instructions=None):
     product = manifest["product"]
-    lines = [RULES_PROMPT, "\n=== PRODUCT ===", json.dumps(product), "\n=== SOURCES ==="]
+    lines = [RULES_PROMPT]
+
+    if extra_instructions:
+        lines.append(
+            "\n=== ADDITIONAL GUIDANCE FROM THE USER (from reviewing an earlier sample) ===\n"
+            "The user reviewed a sample of results from an earlier pass and asked for these "
+            "adjustments. Apply them as refinements within the rules above - they narrow HOW "
+            "you apply the rules, they do not override the non-negotiable ones (never guess or "
+            "invent a value, always cite verbatim from the source, never use the word \"office\").\n"
+            + extra_instructions
+        )
+
+    lines += ["\n=== PRODUCT ===", json.dumps(product), "\n=== SOURCES ==="]
 
     for h, (label, text) in texts.items():
         if text is None:
@@ -234,7 +246,7 @@ def validate_result(result, manifest):
     return None
 
 
-def _process_one(mpath, results_dir, gemini_key, cache_dir, log):
+def _process_one(mpath, results_dir, gemini_key, cache_dir, log, extra_instructions=None):
     part = os.path.splitext(os.path.basename(mpath))[0]
     result_path = os.path.join(results_dir, f"{part}.json")
     if os.path.exists(result_path):
@@ -243,7 +255,7 @@ def _process_one(mpath, results_dir, gemini_key, cache_dir, log):
     with open(mpath, "r", encoding="utf-8") as f:
         manifest = json.load(f)
     texts, errors = gather_sources_text(manifest)
-    prompt = build_prompt(manifest, texts, errors, cache_dir)
+    prompt = build_prompt(manifest, texts, errors, cache_dir, extra_instructions)
 
     result = None
     last_err = None
@@ -271,7 +283,10 @@ def _process_one(mpath, results_dir, gemini_key, cache_dir, log):
         json.dump(result, f, indent=1)
 
 
-def run_validate_phase(manifests_dir: str, results_dir: str, product_filter, gemini_key: str, cache_dir: str, log) -> None:
+def run_validate_phase(
+    manifests_dir: str, results_dir: str, product_filter, gemini_key: str, cache_dir: str, log,
+    extra_instructions=None,
+) -> None:
     os.makedirs(results_dir, exist_ok=True)
     manifest_paths = sorted(glob.glob(os.path.join(manifests_dir, "*.json")))
     selected = [
@@ -279,11 +294,15 @@ def run_validate_phase(manifests_dir: str, results_dir: str, product_filter, gem
         if product_filter(os.path.splitext(os.path.basename(mpath))[0], i)
     ]
 
-    log(f"Validating {len(selected)} product manifests with {VALIDATE_WORKERS} workers")
+    log(f"Validating {len(selected)} product manifests with {VALIDATE_WORKERS} workers"
+        + (" (with user feedback applied)" if extra_instructions else ""))
 
     done = {"n": 0}
     with ThreadPoolExecutor(max_workers=VALIDATE_WORKERS) as ex:
-        futures = [ex.submit(_process_one, mpath, results_dir, gemini_key, cache_dir, log) for mpath in selected]
+        futures = [
+            ex.submit(_process_one, mpath, results_dir, gemini_key, cache_dir, log, extra_instructions)
+            for mpath in selected
+        ]
         for fut in as_completed(futures):
             fut.result()
             done["n"] += 1

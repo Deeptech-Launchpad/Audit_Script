@@ -138,6 +138,22 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="12" x2="19" y2="12"/><polyline points="13 6 19 12 13 18"/></svg>
         </button>
       </div>
+
+      <div id="feedback-history" class="feedback-history hidden">
+        <div class="feedback-history-label">Feedback given so far</div>
+        <ol id="feedback-history-list"></ol>
+      </div>
+
+      <div class="divider"><span>Not quite right?</span></div>
+      <div class="field">
+        <label for="pilot-feedback">Describe what should change</label>
+        <textarea id="pilot-feedback" rows="4" placeholder="e.g. Don't flag unit-abbreviation differences as corrections. Prefer the Datasheet 2 PDF over Datasheet 1 when both are present. Be stricter about matching color names exactly."></textarea>
+        <span class="field-hint">The pilot re-runs on these same products with your guidance applied - repeat as many times as you like before approving.</span>
+      </div>
+      <button id="revise-btn" class="button secondary">
+        <span>Re-run pilot with this feedback</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg>
+      </button>
     </section>
 
     <section id="done-section" class="card reveal hidden">
