@@ -1,0 +1,9 @@
+# Runtime data: uploaded spreadsheets, fetched HTML/PDF cache, job results,
+# and API keys saved via Settings. None of this is source code, and
+# settings.json holds real Scrape.do/Gemini keys in plaintext - never commit it.
+storage/
+
+__pycache__/
+*.pyc
+.venv/
+venv/
