@@ -77,42 +77,60 @@ def detect_schema(header_row):
 
     if attr_section_idx is None:
         # Fallback: derive from attr_label/value position if the exact label differs.
+        # `is not None` matters here - a legitimate column 0 is falsy but valid,
+        # and previously fell through to the "not found" branch by mistake.
         anchor = attr_label_idx if attr_label_idx is not None else attr_value_idx
-        attr_section_idx = anchor - 1 if anchor else n
+        if anchor is not None:
+            attr_section_idx = max(0, anchor - 1)
+        else:
+            # Neither an Attribute Label nor an Attribute Value column could be
+            # found at all - this file's layout doesn't match what this pipeline
+            # expects. Previously this fell back to `n` (one past the last
+            # valid column), which any later `row[attr_section_idx]` lookup
+            # would crash on with "tuple index out of range" instead of a
+            # clear, actionable error. None here forces callers to check and
+            # fail with a real explanation before ever touching a data row.
+            attr_section_idx = None
 
     part_no_idx = 0  # column A is always the product identifier by convention
 
-    # Page-hint columns: name -> column idx, keyed by their base name (page# stripped)
     page_hints = {}
-    for i in range(1, attr_section_idx):
-        if is_page_hint_col(names[i]):
-            page_hints[_norm(page_hint_base_name(names[i]))] = i
-
     html_idx = []
     doc_idx = []  # list of (col_idx, page_idx_or_None)
     product_info_idx = []
-    source_region_started = False
 
-    for i in range(1, attr_section_idx):
-        name = names[i]
-        if is_page_hint_col(name):
-            continue  # handled via page_hints, not its own column
-        if is_html_col(name):
-            source_region_started = True
-            html_idx.append(i)
-        elif is_doc_col(name):
-            source_region_started = True
-            page_idx = page_hints.get(_norm(name))
-            doc_idx.append((i, page_idx))
-        elif not source_region_started:
-            product_info_idx.append(i)
-        else:
-            # Unrecognized column inside the source region (e.g. a URL-bearing
-            # column whose name doesn't say "URL"): treat as a doc column: if
-            # the cell value isn't actually a URL it will simply contribute no
-            # sources for that row (parsed and skipped downstream).
-            page_idx = page_hints.get(_norm(name))
-            doc_idx.append((i, page_idx))
+    # If attr_section_idx couldn't be determined at all (no Attribute
+    # Label/Value column found by any heuristic), there's no reliable
+    # boundary for this loop - leave everything empty rather than guess, and
+    # let the caller see attr_section_idx is None and fail with a clear
+    # message instead of misinterpreting arbitrary columns as product info.
+    if attr_section_idx is not None:
+        # Page-hint columns: name -> column idx, keyed by their base name (page# stripped)
+        for i in range(1, attr_section_idx):
+            if is_page_hint_col(names[i]):
+                page_hints[_norm(page_hint_base_name(names[i]))] = i
+
+        source_region_started = False
+        for i in range(1, attr_section_idx):
+            name = names[i]
+            if is_page_hint_col(name):
+                continue  # handled via page_hints, not its own column
+            if is_html_col(name):
+                source_region_started = True
+                html_idx.append(i)
+            elif is_doc_col(name):
+                source_region_started = True
+                page_idx = page_hints.get(_norm(name))
+                doc_idx.append((i, page_idx))
+            elif not source_region_started:
+                product_info_idx.append(i)
+            else:
+                # Unrecognized column inside the source region (e.g. a URL-bearing
+                # column whose name doesn't say "URL"): treat as a doc column: if
+                # the cell value isn't actually a URL it will simply contribute no
+                # sources for that row (parsed and skipped downstream).
+                page_idx = page_hints.get(_norm(name))
+                doc_idx.append((i, page_idx))
 
     return {
         "names": names,

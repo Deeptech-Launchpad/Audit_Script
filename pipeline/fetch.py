@@ -486,13 +486,44 @@ def run_fetch_phase(
         header = list(next(ws.iter_rows(min_row=1, max_row=1, values_only=True)))
         schema = detect_schema(header)
         names = schema["names"]
+
+        missing = [
+            label for label, key in (
+                ("Attribute Section", "attr_section_idx"), ("Attribute Label", "attr_label_idx"),
+                ("Attribute Value", "attr_value_idx"), ("Attribute UOM", "attr_uom_idx"),
+                ("Attribute Flag", "attr_flag_idx"),
+            ) if schema[key] is None
+        ]
+        if missing:
+            raise ValueError(
+                f"Could not detect these required columns in sheet '{ws.title}': {', '.join(missing)}. "
+                f"This file's column layout doesn't match what the pipeline expects (an Attribute "
+                f"Section/Label/Value/UOM/Flag block) - detected columns were: {names}"
+            )
+
         log(f"Detected columns: part_no='{names[schema['part_no_idx']]}', "
             f"{len(schema['html_idx'])} HTML source col(s), {len(schema['doc_idx'])} document col(s) "
             f"(fetch method: {'Scrape.do' if scrape_do_key else 'Playwright (no key supplied)'})")
 
+        header_len = len(names)
+
+        def _pad(row):
+            # openpyxl's read-only mode (used here for memory efficiency on
+            # large sheets) returns a row exactly as wide as that row's last
+            # written cell - a row whose trailing attribute columns were
+            # simply never touched comes back SHORTER than the header, and
+            # indexing into it at a schema-derived column position beyond
+            # its length raises "tuple index out of range". Real vendor
+            # exports do this constantly, so every row is padded up to the
+            # header's width before anything indexes into it.
+            if len(row) < header_len:
+                return row + (None,) * (header_len - len(row))
+            return row
+
         seen_parts: list[str] = []
         rows_by_part: dict[str, list] = {}
         for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            row = _pad(row)
             part = row[schema["part_no_idx"]]
             if part is None:
                 continue

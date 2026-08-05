@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from pipeline.fetch import run_fetch_phase
+from pipeline.schema import detect_schema
 from pipeline.validate import run_validate_phase
 from pipeline.writeback import run_writeback_phase
 
@@ -184,7 +185,10 @@ async def upload(file: UploadFile):
 
     sheets = wb.sheetnames
     ws = wb[sheets[0]]
-    row_count = sum(1 for row in ws.iter_rows(min_row=2, values_only=True) if row[0] is not None)
+    # `row and ...` guards a genuinely empty row tuple (e.g. a fully blank
+    # spacer row) - openpyxl's read-only mode can return `()` for one,
+    # and `row[0]` on that raises "tuple index out of range".
+    row_count = sum(1 for row in ws.iter_rows(min_row=2, values_only=True) if row and row[0] is not None)
 
     with _jobs_lock:
         job = {
@@ -226,6 +230,31 @@ class PilotRequest(BaseModel):
     gemini_key: str
 
 
+def _check_schema_or_400(upload_path: str, sheet: str) -> None:
+    """Fails fast with a clear, actionable error the moment a pilot is
+    started, rather than several minutes into a fetch phase - a file whose
+    column layout this pipeline can't recognize used to reach row-processing
+    code and crash there with a bare "tuple index out of range"."""
+    wb = openpyxl.load_workbook(upload_path, read_only=True, data_only=True)
+    ws = wb[sheet] if sheet in wb.sheetnames else wb.worksheets[0]
+    header = list(next(ws.iter_rows(min_row=1, max_row=1, values_only=True)))
+    schema = detect_schema(header)
+    missing = [
+        label for label, key in (
+            ("Attribute Section", "attr_section_idx"), ("Attribute Label", "attr_label_idx"),
+            ("Attribute Value", "attr_value_idx"), ("Attribute UOM", "attr_uom_idx"),
+            ("Attribute Flag", "attr_flag_idx"),
+        ) if schema[key] is None
+    ]
+    if missing:
+        raise HTTPException(
+            400,
+            f"Could not detect these required columns in sheet '{ws.title}': {', '.join(missing)}. "
+            f"This file's column layout doesn't match what the pipeline expects (an Attribute "
+            f"Section/Label/Value/UOM/Flag block).",
+        )
+
+
 @app.post("/api/jobs/{job_id}/pilot")
 def start_pilot(job_id: str, body: PilotRequest):
     with _jobs_lock:
@@ -236,6 +265,9 @@ def start_pilot(job_id: str, body: PilotRequest):
             raise HTTPException(400, f"Job already started (status={job['status']})")
         if _run_lock.locked():
             raise HTTPException(409, "Another run is already in progress - please wait for it to finish")
+
+        _check_schema_or_400(job["upload_path"], body.sheet)
+
         job["sheet"] = body.sheet
         job["pilot_size"] = body.pilot_size
         job["_gemini_key"] = body.gemini_key
