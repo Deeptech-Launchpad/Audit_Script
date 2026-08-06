@@ -43,6 +43,23 @@ def page_hint_base_name(name):
     return re.sub(r"\s*page\s*#?$", "", n, flags=re.IGNORECASE).strip()
 
 
+def match_page_hint(page_hints, norm_name):
+    """Pairs a document column with its "<name> Page#" hint column. An exact
+    match on the normalized base name covers most cases (e.g. "Datasheet 1"
+    <-> "Datasheet 1 Page#"), but some real templates name the document
+    column with an extra trailing word the page-hint column doesn't repeat
+    (e.g. doc column "Third Party PDF URL" vs hint column "Third Party PDF
+    Page#" - base name "Third Party PDF" without "URL"). A prefix match
+    either direction catches that without needing to special-case specific
+    trailing words."""
+    if norm_name in page_hints:
+        return page_hints[norm_name]
+    for key, idx in page_hints.items():
+        if key and (norm_name.startswith(key) or key.startswith(norm_name)):
+            return idx
+    return None
+
+
 def detect_schema(header_row):
     """header_row: list of column header strings (0-indexed, column A first).
     Returns a dict describing the layout; all *_idx fields are 0-indexed."""
@@ -64,15 +81,35 @@ def detect_schema(header_row):
         return None
 
     attr_section_idx = find_exact("attribute section")
+
+    # Two known naming conventions for the attribute block, tried in order:
+    # "Attr Label/Value/UOM/Flag" (MMEM, Rexel) and "Attribute Name/Build
+    # Value/UOM/Source Flag" (the Deeptech template) - the latter also has an
+    # extra "Raw Value" column (long supporting text) alongside "Build Value"
+    # (the short structured value), so attr_value_idx must specifically
+    # target "build"+"value" and never a bare "value" match, or it would
+    # grab the wrong column.
     attr_label_idx = find_contains("attr", "label")
+    if attr_label_idx is None:
+        attr_label_idx = find_contains("attr", "name")
+
     attr_value_idx = None
     for i, h in enumerate(names):
         hl = _norm(h)
         if "attr" in hl and "value" in hl and "uom" not in hl:
             attr_value_idx = i
             break
+    if attr_value_idx is None:
+        attr_value_idx = find_contains("build", "value")
+
     attr_uom_idx = find_contains("attr", "uom")
+    if attr_uom_idx is None:
+        attr_uom_idx = find_exact("uom")
+
     attr_flag_idx = find_contains("attr", "flag")
+    if attr_flag_idx is None:
+        attr_flag_idx = find_contains("source", "flag")
+
     status_idx = find_exact("status")
 
     if attr_section_idx is None:
@@ -120,7 +157,7 @@ def detect_schema(header_row):
                 html_idx.append(i)
             elif is_doc_col(name):
                 source_region_started = True
-                page_idx = page_hints.get(_norm(name))
+                page_idx = match_page_hint(page_hints, _norm(name))
                 doc_idx.append((i, page_idx))
             elif not source_region_started:
                 product_info_idx.append(i)
@@ -129,7 +166,7 @@ def detect_schema(header_row):
                 # column whose name doesn't say "URL"): treat as a doc column: if
                 # the cell value isn't actually a URL it will simply contribute no
                 # sources for that row (parsed and skipped downstream).
-                page_idx = page_hints.get(_norm(name))
+                page_idx = match_page_hint(page_hints, _norm(name))
                 doc_idx.append((i, page_idx))
 
     return {
