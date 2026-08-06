@@ -630,6 +630,12 @@ def run_fetch_phase(
                     "attr_uom": row[schema["attr_uom_idx"]],
                     "attr_flag": row[schema["attr_flag_idx"]],
                     "status": row[schema["status_idx"]] if schema["status_idx"] is not None else None,
+                    # Optional enrichment columns (Deeptech template) - None
+                    # on templates that don't have them, which validate.py
+                    # treats as "no extra context available" and skips.
+                    "definition": row[schema["definition_idx"]] if schema["definition_idx"] is not None else None,
+                    "allowed_values": row[schema["allowed_values_idx"]] if schema["allowed_values_idx"] is not None else None,
+                    "data_type": row[schema["data_type_idx"]] if schema["data_type_idx"] is not None else None,
                     "sources": row_sources,
                 })
             manifest = {"product": product_info, "sources": sources, "attributes": attrs}

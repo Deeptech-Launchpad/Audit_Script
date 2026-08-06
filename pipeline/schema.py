@@ -112,6 +112,13 @@ def detect_schema(header_row):
 
     status_idx = find_exact("status")
 
+    # Optional enrichment columns (Deeptech template only) - used as extra
+    # validation context when present, but never required, so older
+    # templates without them keep working unchanged.
+    definition_idx = find_exact("definition")
+    allowed_values_idx = find_exact("allowed values")
+    data_type_idx = find_exact("data type")
+
     if attr_section_idx is None:
         # Fallback: derive from attr_label/value position if the exact label differs.
         # `is not None` matters here - a legitimate column 0 is falsy but valid,
@@ -181,5 +188,9 @@ def detect_schema(header_row):
         "attr_uom_idx": attr_uom_idx,
         "attr_flag_idx": attr_flag_idx,
         "status_idx": status_idx,
+        "definition_idx": definition_idx,
+        "allowed_values_idx": allowed_values_idx,
+        "data_type_idx": data_type_idx,
         "audit_flag_idx": n,  # append new column right after the last existing one
+        "uom_comments_idx": n + 1,  # append right after Audit Flag
     }

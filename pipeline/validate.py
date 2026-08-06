@@ -32,9 +32,10 @@ RESULT_SCHEMA = {
                     "final_value": {"type": "string", "nullable": True},
                     "final_uom": {"type": "string", "nullable": True},
                     "flag_text": {"type": "string", "nullable": True},
+                    "uom_comment": {"type": "string", "nullable": True},
                     "reasoning": {"type": "string"},
                 },
-                "required": ["row_idx", "final_value", "final_uom", "flag_text", "reasoning"],
+                "required": ["row_idx", "final_value", "final_uom", "flag_text", "uom_comment", "reasoning"],
             },
         }
     },
@@ -45,21 +46,35 @@ RULES_PROMPT = """You are independently verifying every product row using the HT
 - attr_label: the attribute name (e.g. "Voltage", "Current").
 - attr_value, attr_uom: the currently recorded Attribute Value and Attribute UOM for this attribute.
 - attr_flag: which source type was previously cited as backing this value (MFR_HTML = the HTML product page, MFR_PDF = a PDF document, MFR_Image = an image, Legacy_Data/Existing_Data = pre-existing data not necessarily sourced from these docs, or blank/None = not sourced).
+- definition, allowed_values, data_type: present on some templates only (null when not available) - see the ADDITIONAL VALIDATION CRITERIA and UOM VALIDATION sections below for how to use them.
 
 You are also given the extracted text of the HTML product page(s) and PDF document(s) associated with this product (labeled by source).
 
 IMPORTANT WORDING RULE: Never use the word "office" or phrases like "Office listed" in flag_text or reasoning. Refer to the actual field by name instead, e.g. "Attribute Value" / "Attribute UOM". Example: "Attribute Value recorded as 250V but HTML states 230V" (not "Office listed Voltage=250V but HTML states 230V").
 
 For EACH attribute row, decide:
-1. If the recorded Attribute Value/UOM is directly supported by the source text (exact or clearly equivalent match) -> it is CORRECT. Return final_value/final_uom as an EXACT, VERBATIM COPY of the original attr_value/attr_uom given to you (same text, same abbreviation style, same spelling) - do NOT rephrase, normalize, expand, or abbreviate it (e.g. do not change "Amp" to "A", or "Volt AC/DC" to "V AC/DC") even if the source phrases the unit differently. flag_text = "Correct". reasoning may briefly note where it was confirmed.
+1. If the recorded Attribute Value/UOM is directly supported by the source text (exact or clearly equivalent match) -> it is CORRECT. Return final_value/final_uom as an EXACT, VERBATIM COPY of the original attr_value/attr_uom given to you (same text, same abbreviation style, same spelling) - do NOT rephrase, normalize, expand, or abbreviate it (e.g. do not change "Amp" to "A", or "Volt AC/DC" to "V AC/DC") even if the source phrases the unit differently. flag_text = "Value Correct". reasoning may briefly note where it was confirmed.
 2. If the recorded Attribute Value/UOM CONTRADICTS what the source text says (the source explicitly states a DIFFERENT, SUBSTANTIVE value for that same attribute - a different number, a different range, a different named category/color/material) -> it is INCORRECT. Return final_value/final_uom = the CORRECTED value taken verbatim from the source text, and flag_text = a short description of the discrepancy naming the field, e.g. "Attribute Value recorded as 250V but HTML states 230V".
-   CRITICAL - do NOT treat these as contradictions (they are case 1, CORRECT, verbatim echo, flag_text = "Correct"): mere notation/abbreviation/formatting differences that represent the SAME underlying value. Examples of things that are the SAME (not a contradiction): "Amp" vs "A"; "Volt AC" vs "VAC" vs "V AC"; "3 Phase" vs "3" vs "3PH"; "2 Changeover (SPDT)" vs "2 C/O (SPDT)" vs "2 CO"; "100000 Cycles" vs "100000 Operations"; different digit grouping/spacing/capitalization of the same number or word. Only flag a contradiction when the actual substantive value differs (e.g. a different number, a different named color, a different specific rating) - not when it's the same value written in different shorthand.
+   CRITICAL - do NOT treat these as contradictions (they are case 1, CORRECT, verbatim echo, flag_text = "Value Correct"): mere notation/abbreviation/formatting differences that represent the SAME underlying value. Examples of things that are the SAME (not a contradiction): "Amp" vs "A"; "Volt AC" vs "VAC" vs "V AC"; "3 Phase" vs "3" vs "3PH"; "2 Changeover (SPDT)" vs "2 C/O (SPDT)" vs "2 CO"; "100000 Cycles" vs "100000 Operations"; different digit grouping/spacing/capitalization of the same number or word. Only flag a contradiction when the actual substantive value differs (e.g. a different number, a different named color, a different specific rating) - not when it's the same value written in different shorthand.
 3. If attr_value is empty/missing AND the correct value IS explicitly present in the source text -> FILL IT. Return final_value/final_uom = the value found in the source. This is NOT a problem, but you MUST still record where the value came from so it can be verified: set flag_text to "Filled from HTML" if only the HTML page stated it, "Filled from PDF" if only a PDF document stated it, or "Filled from HTML and PDF" if both independently confirm it. Always name the source type this way for every auto-fill - never leave flag_text null for a fill.
-4. If attr_value is empty/missing AND the value is NOT found in any available source -> leave final_value/final_uom = null, flag_text = null (leave both fields empty). Never guess or generate information that is not explicitly available.
+4. If attr_value is empty/missing AND the value is NOT found in any available source -> leave final_value/final_uom = null, and set flag_text = "No Data Found in Source". Never guess or generate information that is not explicitly available.
 4b. IMPORTANT: If attr_value/attr_uom already has a recorded value, and that specific value is simply NOT MENTIONED anywhere in the available source text (this is different from case 2 - there is no explicit contradicting value, the topic is just absent from what you were given) -> do NOT null it out. This is not necessarily wrong; our source excerpt may simply be incomplete. Return final_value = the ORIGINAL attr_value unchanged, final_uom = the ORIGINAL attr_uom unchanged, and flag_text = a short note such as "Could not verify Attribute Value against available sources" so a human can double check. Only use case 2 (correction) when the source gives an explicit, specific, conflicting value for that exact attribute.
 5. If a value exists but none of the available sources for this row could be accessed/parsed at all (i.e. every relevant source for this row failed), you MUST still evaluate against whatever sources DID load; only if literally none loaded for this row's cited source type should flag_text carry an error, formatted EXACTLY as "HEAD NODE ERROR: <reason>" if the failure was an HTML page, or "PDF ERROR: <reason>" if it was a PDF. Use the error reason text given to you in the source list.
-6. Never invent or infer values not explicitly present in the given source text. If uncertain, treat as case 4 (leave blank) rather than guessing.
-7. flag_text must be exactly "Correct" whenever the row was already filled in and is verified correct (case 1). For an auto-fill (case 3), flag_text must instead be exactly one of "Filled from HTML", "Filled from PDF", or "Filled from HTML and PDF" (never "Correct" for a fill - the source must always be stated). Only use a different flag_text when there is an actual problem: a contradiction (case 2), an access error (case 5), or an unconfirmed pre-existing value (case 4b). For case 4 (left blank, nothing found), flag_text is null.
+6. Never invent or infer values not explicitly present in the given source text. If uncertain, treat as case 4 (leave blank, flag_text = "No Data Found in Source") rather than guessing.
+7. flag_text must be exactly "Value Correct" whenever the row was already filled in and is verified correct (case 1). For an auto-fill (case 3), flag_text must instead be exactly one of "Filled from HTML", "Filled from PDF", or "Filled from HTML and PDF" (never "Value Correct" for a fill - the source must always be stated). Only use a different flag_text when there is an actual problem: a contradiction (case 2), an access error (case 5), or an unconfirmed pre-existing value (case 4b). For case 4 (nothing found anywhere), flag_text is exactly "No Data Found in Source".
+
+=== ADDITIONAL VALIDATION CRITERIA (only when definition/allowed_values/data_type are not null) ===
+Some templates also provide, per attribute:
+- definition: what this attribute is intended to represent. Use this ONLY as context to understand an ambiguous attr_label - it does not by itself dictate what the value must be.
+- allowed_values: a documented list of valid options for this attribute, when it has a fixed/controlled vocabulary (options separated by ";" or similar).
+- data_type: the expected kind of value - "number" (attr_value should be purely numeric, with any unit recorded separately in attr_uom, not embedded in attr_value) or "text" (a text value, which may legitimately include its unit written directly in the text, e.g. "1/8 in NPT").
+When these are present, apply them as ADDITIONAL correctness criteria alongside the source-based rules above (case 1-5 still apply first; this section refines HOW you judge correctness, it does not add a new case):
+- If allowed_values lists specific options and the recorded value doesn't match any of them (nor a clear equivalent/synonym/notation variant, per the case 2 CRITICAL note above), and the source confirms a value that DOES match one of the allowed options, treat this as a case 2 contradiction and correct it to that allowed value. If the source doesn't clearly confirm any specific allowed value, treat it as case 4b (unconfirmed) rather than guessing which allowed value is correct.
+- If data_type is "number" and attr_value contains non-numeric text beyond a simple range/unit (letters that aren't a unit, embedded words, etc.), note this in reasoning, but only change final_value if the source explicitly supports a specific corrected numeric value - never strip or guess-reformat the value yourself.
+
+=== UOM VALIDATION (separate from the value correctness decision above - always evaluate this independently for every row) ===
+Using the source text, definition, and allowed_values as evidence of what unit this attribute should actually use, check whether the recorded unit is correct - the unit may be in attr_uom (typical when data_type is "number") or embedded directly inside attr_value's text (typical when data_type is "text", e.g. "1/8 in NPT"). Example: if the source or definition indicates the correct unit is "in" but the recorded value uses "mm", that is a UOM mismatch.
+Set uom_comment ONLY when you find an actual, source-supported UOM mismatch, briefly naming both units, e.g. "UOM recorded as mm but source indicates in". Leave uom_comment null in every other case - no unit is expected for this attribute, no unit is recorded to check, the recorded unit is correct, or there isn't enough source evidence to be sure. Never populate uom_comment just to confirm the UOM is fine, and never guess a mismatch without explicit source support.
 
 Respond with a JSON object matching the required schema, one entry per attribute row_idx you were given (do not skip any).
 """
@@ -180,6 +195,11 @@ def build_prompt(manifest, texts, errors, cache_dir, extra_instructions=None):
             "attr_value": attr["attr_value"],
             "attr_uom": attr["attr_uom"],
             "attr_flag": attr["attr_flag"],
+            # .get(), not [...]: absent on manifests built before this field
+            # existed, and null on any template that doesn't have these columns.
+            "definition": attr.get("definition"),
+            "allowed_values": attr.get("allowed_values"),
+            "data_type": attr.get("data_type"),
         }
         extra_excerpts = []
         for d in attr["sources"]["docs"]:
@@ -239,7 +259,7 @@ def validate_result(result, manifest):
         extra = set(got_rows) - set(expected)
         return f"row_idx mismatch: missing={missing} extra={extra}"
     for it in items:
-        for field in ("final_value", "final_uom", "flag_text"):
+        for field in ("final_value", "final_uom", "flag_text", "uom_comment"):
             v = it.get(field)
             if v and (len(str(v)) > 500 or "</body" in str(v) or "<html" in str(v)):
                 return f"row {it.get('row_idx')} field '{field}' looks corrupted (length {len(str(v))})"

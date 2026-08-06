@@ -79,16 +79,19 @@ def run_writeback_phase(input_path, output_path, results_dir, manifests_dir, she
     COL_Z = schema["attr_value_idx"] + 1
     COL_AA = schema["attr_uom_idx"] + 1
     COL_AD = schema["audit_flag_idx"] + 1
+    COL_UOM_COMMENTS = schema["uom_comments_idx"] + 1
 
     if ws.cell(row=1, column=COL_AD).value in (None, ""):
         ws.cell(row=1, column=COL_AD, value="Audit Flag")
+    if ws.cell(row=1, column=COL_UOM_COMMENTS).value in (None, ""):
+        ws.cell(row=1, column=COL_UOM_COMMENTS, value="UOM Comments")
 
     result_paths = sorted(glob.glob(os.path.join(results_dir, "*.json")))
     if product_keys is not None:
         result_paths = [rp for rp in result_paths if os.path.splitext(os.path.basename(rp))[0] in product_keys]
 
     stats = {"rows_covered": 0, "corrected": 0, "filled": 0, "unconfirmed": 0,
-             "errors": 0, "confirmed_ok": 0, "load_errors": 0}
+             "errors": 0, "confirmed_ok": 0, "load_errors": 0, "no_data_found": 0}
 
     for rp in result_paths:
         with open(rp, "r", encoding="utf-8") as f:
@@ -115,7 +118,7 @@ def run_writeback_phase(input_path, output_path, results_dir, manifests_dir, she
             seen_rows.add(row_idx)
 
             corrupted = False
-            for field in ("final_value", "final_uom", "flag_text"):
+            for field in ("final_value", "final_uom", "flag_text", "uom_comment"):
                 v = item.get(field)
                 if v and (len(str(v)) > 500 or "</body" in str(v) or "<html" in str(v)):
                     corrupted = True
@@ -126,6 +129,7 @@ def run_writeback_phase(input_path, output_path, results_dir, manifests_dir, she
             final_value = item.get("final_value")
             final_uom = item.get("final_uom")
             flag_text = item.get("flag_text")
+            uom_comment = item.get("uom_comment")
 
             orig_value = norm(ws.cell(row=row_idx, column=COL_Z).value)
             orig_uom = norm(ws.cell(row=row_idx, column=COL_AA).value)
@@ -136,10 +140,11 @@ def run_writeback_phase(input_path, output_path, results_dir, manifests_dir, she
 
             is_error = bool(flag_text) and flag_text.startswith(("HEAD NODE ERROR", "PDF ERROR"))
             is_unconfirmed = bool(flag_text) and flag_text.startswith("Could not verify")
-            is_marked_correct = flag_text == "Correct"
+            is_marked_correct = flag_text == "Value Correct"
             is_filled_marker = bool(flag_text) and flag_text.startswith("Filled from")
+            is_no_data_found = flag_text == "No Data Found in Source"
             is_real_correction = (bool(flag_text) and not is_error and not is_unconfirmed
-                                   and not is_marked_correct and not is_filled_marker)
+                                   and not is_marked_correct and not is_filled_marker and not is_no_data_found)
             fill_write = not orig_value
 
             allow_write = is_real_correction
@@ -148,20 +153,23 @@ def run_writeback_phase(input_path, output_path, results_dir, manifests_dir, she
                 allow_write = False
                 is_real_correction = False
                 is_marked_correct = True
-                flag_text = "Correct"
+                flag_text = "Value Correct"
 
             if is_filled_marker and not fill_write:
                 is_filled_marker = False
                 is_marked_correct = True
-                flag_text = "Correct"
+                flag_text = "Value Correct"
             elif is_filled_marker and fill_write and not new_value and not new_uom:
                 is_filled_marker = False
-                flag_text = None
+                is_no_data_found = True
+                flag_text = "No Data Found in Source"
 
             if is_error:
                 stats["errors"] += 1
             elif is_unconfirmed:
                 stats["unconfirmed"] += 1
+            elif is_no_data_found:
+                stats["no_data_found"] += 1
             elif fill_write and new_value:
                 stats["filled"] += 1
             elif is_real_correction and (new_value != orig_value or new_uom != orig_uom):
@@ -179,6 +187,12 @@ def run_writeback_phase(input_path, output_path, results_dir, manifests_dir, she
 
             ad_value = clean(flag_text) if flag_text else None
             ws.cell(row=row_idx, column=COL_AD).value = ad_value
+
+            # "Only report rows where a UOM issue exists" - the output is a
+            # fresh copy of the original file each run, so the cell already
+            # starts blank; only ever write when there's an actual comment.
+            if uom_comment:
+                ws.cell(row=row_idx, column=COL_UOM_COMMENTS).value = clean(uom_comment)
 
     wb.save(output_path)
     if log:
