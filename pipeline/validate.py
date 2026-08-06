@@ -32,10 +32,12 @@ RESULT_SCHEMA = {
                     "final_value": {"type": "string", "nullable": True},
                     "final_uom": {"type": "string", "nullable": True},
                     "flag_text": {"type": "string", "nullable": True},
-                    "uom_comment": {"type": "string", "nullable": True},
+                    "uom_recorded": {"type": "string", "nullable": True},
+                    "uom_source": {"type": "string", "nullable": True},
                     "reasoning": {"type": "string"},
                 },
-                "required": ["row_idx", "final_value", "final_uom", "flag_text", "uom_comment", "reasoning"],
+                "required": ["row_idx", "final_value", "final_uom", "flag_text", "uom_recorded", "uom_source",
+                             "reasoning"],
             },
         }
     },
@@ -46,7 +48,7 @@ RULES_PROMPT = """You are independently verifying every product row using the HT
 - attr_label: the attribute name (e.g. "Voltage", "Current").
 - attr_value, attr_uom: the currently recorded Attribute Value and Attribute UOM for this attribute.
 - attr_flag: which source type was previously cited as backing this value (MFR_HTML = the HTML product page, MFR_PDF = a PDF document, MFR_Image = an image, Legacy_Data/Existing_Data = pre-existing data not necessarily sourced from these docs, or blank/None = not sourced).
-- definition, allowed_values, data_type: present on some templates only (null when not available) - see the ADDITIONAL VALIDATION CRITERIA and UOM VALIDATION sections below for how to use them.
+- definition, allowed_values, data_type: present on some templates only (null when not available) - see the ADDITIONAL CONTEXT and UOM VALIDATION sections below for how to use them.
 
 You are also given the extracted text of the HTML product page(s) and PDF document(s) associated with this product (labeled by source).
 
@@ -63,18 +65,18 @@ For EACH attribute row, decide:
 6. Never invent or infer values not explicitly present in the given source text. If uncertain, treat as case 4 (leave blank, flag_text = "No Data Found in Source") rather than guessing.
 7. flag_text must be exactly "Value Correct" whenever the row was already filled in and is verified correct (case 1). For an auto-fill (case 3), flag_text must instead be exactly one of "Filled from HTML", "Filled from PDF", or "Filled from HTML and PDF" (never "Value Correct" for a fill - the source must always be stated). Only use a different flag_text when there is an actual problem: a contradiction (case 2), an access error (case 5), or an unconfirmed pre-existing value (case 4b). For case 4 (nothing found anywhere), flag_text is exactly "No Data Found in Source".
 
-=== ADDITIONAL VALIDATION CRITERIA (only when definition/allowed_values/data_type are not null) ===
+=== ADDITIONAL CONTEXT (only when definition/allowed_values/data_type are not null - CONTEXT ONLY, does not change cases 1-7 above) ===
 Some templates also provide, per attribute:
-- definition: what this attribute is intended to represent. Use this ONLY as context to understand an ambiguous attr_label - it does not by itself dictate what the value must be.
-- allowed_values: a documented list of valid options for this attribute, when it has a fixed/controlled vocabulary (options separated by ";" or similar).
-- data_type: the expected kind of value - "number" (attr_value should be purely numeric, with any unit recorded separately in attr_uom, not embedded in attr_value) or "text" (a text value, which may legitimately include its unit written directly in the text, e.g. "1/8 in NPT").
-When these are present, apply them as ADDITIONAL correctness criteria alongside the source-based rules above (case 1-5 still apply first; this section refines HOW you judge correctness, it does not add a new case):
-- If allowed_values lists specific options and the recorded value doesn't match any of them (nor a clear equivalent/synonym/notation variant, per the case 2 CRITICAL note above), and the source confirms a value that DOES match one of the allowed options, treat this as a case 2 contradiction and correct it to that allowed value. If the source doesn't clearly confirm any specific allowed value, treat it as case 4b (unconfirmed) rather than guessing which allowed value is correct.
-- If data_type is "number" and attr_value contains non-numeric text beyond a simple range/unit (letters that aren't a unit, embedded words, etc.), note this in reasoning, but only change final_value if the source explicitly supports a specific corrected numeric value - never strip or guess-reformat the value yourself.
+- definition: what this attribute is intended to represent.
+- allowed_values: a documented list of valid options for this attribute, when it has a fixed/controlled vocabulary.
+- data_type: "number" or "text", the expected kind of value.
+Use these ONLY to understand an ambiguous attr_label, or to know which of several allowed options the source is confirming when correcting a case-2 contradiction. They must NOT make you more willing to flag something as incorrect, uncertain, or worth commenting on than you would be under cases 1-7 alone. If definition/allowed_values/data_type are null, or don't clearly resolve something, that is not itself a problem - proceed exactly as if this section did not exist.
 
-=== UOM VALIDATION (separate from the value correctness decision above - always evaluate this independently for every row) ===
-Using the source text, definition, and allowed_values as evidence of what unit this attribute should actually use, check whether the recorded unit is correct - the unit may be in attr_uom (typical when data_type is "number") or embedded directly inside attr_value's text (typical when data_type is "text", e.g. "1/8 in NPT"). Example: if the source or definition indicates the correct unit is "in" but the recorded value uses "mm", that is a UOM mismatch.
-Set uom_comment ONLY when you find an actual, source-supported UOM mismatch, briefly naming both units, e.g. "UOM recorded as mm but source indicates in". Leave uom_comment null in every other case - no unit is expected for this attribute, no unit is recorded to check, the recorded unit is correct, or there isn't enough source evidence to be sure. Never populate uom_comment just to confirm the UOM is fine, and never guess a mismatch without explicit source support.
+=== UOM VALIDATION (a SEPARATE, OPTIONAL annotation - must have ZERO effect on final_value, final_uom, or flag_text, which are decided purely by cases 1-7 above) ===
+Populate BOTH uom_recorded and uom_source (each a single short concrete unit word/symbol, e.g. "mm", "in", "A" - never a sentence or description) ONLY when ALL of the following are true:
+1. The recorded data has an actual, specific, named unit - either in attr_uom, or unambiguously embedded in attr_value's text (e.g. "1/4 in", "10 ft").
+2. The source text (or definition) explicitly and unambiguously states a DIFFERENT specific named unit for that exact same measurement - not a description, not a category name, and not silence on the topic.
+In every other situation, leave BOTH uom_recorded and uom_source null - do not fill in just one. This includes: attr_uom is simply blank/not recorded (normal for many attributes, not itself a "mismatch" to report), the source does not explicitly mention a unit at all, you are unsure, or the source disagrees with the VALUE (already handled by case 2 above) rather than specifically the unit. Never write a vague phrase in place of an actual unit (e.g. never write "no unit", "embedded in value", or any multi-word description into either field) - if you cannot name two concrete, specific unit words, leave both null. Whether the two units you name actually differ (e.g. "A" and "Amp" are the same unit, not a mismatch) is checked separately after your response - just report the two literal unit words/symbols you found on each side, verbatim, without judging equivalence yourself.
 
 Respond with a JSON object matching the required schema, one entry per attribute row_idx you were given (do not skip any).
 """
@@ -259,10 +261,79 @@ def validate_result(result, manifest):
         extra = set(got_rows) - set(expected)
         return f"row_idx mismatch: missing={missing} extra={extra}"
     for it in items:
-        for field in ("final_value", "final_uom", "flag_text", "uom_comment"):
+        for field in ("final_value", "final_uom", "flag_text", "uom_recorded", "uom_source"):
             v = it.get(field)
             if v and (len(str(v)) > 500 or "</body" in str(v) or "<html" in str(v)):
                 return f"row {it.get('row_idx')} field '{field}' looks corrupted (length {len(str(v))})"
+    return None
+
+
+# Canonical unit spellings, keyed by lowercased/de-pluralized form - lets
+# _uom_equivalent() catch same-unit variants (e.g. "A" vs "Amp", "mm" vs
+# "millimeter") deterministically rather than trusting Gemini to reliably
+# self-apply the same notation-equivalence judgment it's asked to apply
+# elsewhere (in practice it doesn't: it reported "A" vs "Amp" and even "mm"
+# vs "mm" as mismatches, so this is a hard backstop, not just prompt wording).
+_UOM_CANON = {
+    "a": "a", "amp": "a", "amps": "a", "ampere": "a", "amperes": "a",
+    "v": "v", "volt": "v", "volts": "v",
+    "w": "w", "watt": "w", "watts": "w",
+    "hz": "hz", "hertz": "hz",
+    "in": "in", "inch": "in", "inches": "in",
+    "ft": "ft", "foot": "ft", "feet": "ft",
+    "mm": "mm", "millimeter": "mm", "millimeters": "mm", "millimetre": "mm", "millimetres": "mm",
+    "cm": "cm", "centimeter": "cm", "centimeters": "cm", "centimetre": "cm", "centimetres": "cm",
+    "m": "m", "meter": "m", "meters": "m", "metre": "m", "metres": "m",
+    "lb": "lb", "lbs": "lb", "pound": "lb", "pounds": "lb",
+    "kg": "kg", "kilogram": "kg", "kilograms": "kg",
+    "g": "g", "gram": "g", "grams": "g",
+    "c": "c", "celsius": "c",
+    "f": "f", "fahrenheit": "f",
+    "psi": "psi",
+}
+
+# Any of these appearing in what's supposed to be a bare unit word means
+# Gemini ignored the "single concrete unit word" instruction and wrote a
+# description instead (e.g. "no unit", "embedded in value") - never usable
+# as one side of a mismatch.
+_UOM_INVALID_MARKERS = ("no unit", "not ", "unclear", "embed", "unknown", "n/a", "none", "null", " for ")
+
+# Short abbreviations that look like a unit but aren't one (e.g. "ID"/"OD" =
+# inner/outer diameter, a dimension qualifier, not a unit of measure) -
+# reported in testing as a false "UOM mismatch" against a real unit like "in".
+_UOM_NONUNIT_WORDS = {"id", "od", "na", "tbd", "ea", "qty", "pcs", "no", "ref"}
+
+
+def _looks_like_unit_token(s):
+    if not s:
+        return False
+    s = str(s).strip()
+    if not s or len(s) > 20 or len(s.split()) > 2:
+        return False
+    low = s.lower().rstrip(".")
+    if low in _UOM_NONUNIT_WORDS:
+        return False
+    return not any(m in low for m in _UOM_INVALID_MARKERS)
+
+
+def _normalize_uom_token(s):
+    s = str(s).strip().lower().rstrip(".").replace("°", "")
+    return _UOM_CANON.get(s, s)
+
+
+def _uom_equivalent(a, b):
+    return _normalize_uom_token(a) == _normalize_uom_token(b)
+
+
+def _resolve_uom_comment(item):
+    """Turns the raw uom_recorded/uom_source pair Gemini reported into the
+    final uom_comment string, or None - deterministically, so a same-unit or
+    garbled report can never reach the output (see _UOM_CANON note above)."""
+    recorded = item.pop("uom_recorded", None)
+    source = item.pop("uom_source", None)
+    if (recorded and source and _looks_like_unit_token(recorded) and _looks_like_unit_token(source)
+            and not _uom_equivalent(recorded, source)):
+        return f"UOM recorded as {recorded} but source indicates {source}"
     return None
 
 
@@ -298,6 +369,9 @@ def _process_one(mpath, results_dir, gemini_key, cache_dir, log, extra_instructi
     if result is None:
         log(f"{part}: giving up after retries - {last_err}")
         result = {"error": last_err}
+    else:
+        for it in result.get("results", []):
+            it["uom_comment"] = _resolve_uom_comment(it)
 
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=1)
