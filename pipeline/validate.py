@@ -7,6 +7,7 @@ real client datasets).
 import glob
 import json
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -60,9 +61,9 @@ For EACH attribute row, decide:
    CRITICAL - do NOT treat these as contradictions (they are case 1, CORRECT, verbatim echo, flag_text = "Value Correct"): mere notation/abbreviation/formatting differences that represent the SAME underlying value. Examples of things that are the SAME (not a contradiction): "Amp" vs "A"; "Volt AC" vs "VAC" vs "V AC"; "3 Phase" vs "3" vs "3PH"; "2 Changeover (SPDT)" vs "2 C/O (SPDT)" vs "2 CO"; "100000 Cycles" vs "100000 Operations"; different digit grouping/spacing/capitalization of the same number or word. Only flag a contradiction when the actual substantive value differs (e.g. a different number, a different named color, a different specific rating) - not when it's the same value written in different shorthand.
    This also covers unit-conversion equivalence: if the recorded number, converted using the standard conversion factor between its own unit and a different unit the source states, equals the source's number for that same measurement (e.g. 3.5 in = 88.9 mm), the underlying physical value is the SAME, not a contradiction - treat it as case 1: final_value/final_uom = verbatim echo of the original, flag_text = exactly "Value Correct" (do NOT describe the unit discrepancy in flag_text - that is the separate UOM VALIDATION section's job below, never this one's). Only treat it as a genuine case-2 contradiction when no such unit conversion reconciles the two numbers.
 3. If attr_value is empty/missing AND the correct value IS explicitly present in the source text -> FILL IT. Return final_value/final_uom = the value found in the source. This is NOT a problem, but you MUST still record where the value came from so it can be verified: set flag_text to "Filled from HTML" if only the HTML page stated it, "Filled from PDF" if only a PDF document stated it, or "Filled from HTML and PDF" if both independently confirm it. Always name the source type this way for every auto-fill - never leave flag_text null for a fill.
-4. If attr_value is empty/missing AND the value is NOT found in any available source -> leave final_value/final_uom = null, and set flag_text = "No Data Found in Source". Never guess or generate information that is not explicitly available.
+4. If attr_value is empty/missing AND the value is NOT found in any available source -> leave final_value/final_uom = null, and set flag_text = "No Data Found in Source". Never guess or generate information that is not explicitly available. CRITICAL: this wording is a factual finding - it asserts that the sources WERE read and simply do not state this attribute. It therefore only applies when at least one source for this row actually loaded. If every source for this row is marked UNAVAILABLE, you learned nothing about this attribute and MUST use case 5 instead, even though attr_value is empty.
 4b. IMPORTANT: If attr_value/attr_uom already has a recorded value, and that specific value is simply NOT MENTIONED anywhere in the available source text (this is different from case 2 - there is no explicit contradicting value, the topic is just absent from what you were given) -> do NOT null it out. This is not necessarily wrong; our source excerpt may simply be incomplete. Return final_value = the ORIGINAL attr_value unchanged, final_uom = the ORIGINAL attr_uom unchanged, and flag_text = a short note such as "Could not verify Attribute Value against available sources" so a human can double check. Only use case 2 (correction) when the source gives an explicit, specific, conflicting value for that exact attribute.
-5. If a value exists but none of the available sources for this row could be accessed/parsed at all (i.e. every relevant source for this row failed), you MUST still evaluate against whatever sources DID load; only if literally none loaded for this row's cited source type should flag_text carry an error, formatted EXACTLY as "HEAD NODE ERROR: <reason>" if the failure was an HTML page, or "PDF ERROR: <reason>" if it was a PDF. Use the error reason text given to you in the source list.
+5. If none of the available sources for this row could be accessed/parsed at all (i.e. every relevant source for this row is marked UNAVAILABLE) -> this applies WHETHER OR NOT attr_value is empty. You MUST still evaluate against whatever sources DID load; only if literally none loaded should flag_text carry an error, formatted EXACTLY as "HEAD NODE ERROR: <reason>" if the failure was an HTML page, or "PDF ERROR: <reason>" if it was a PDF. Use the error reason text given to you in the source list. Leave final_value/final_uom as the ORIGINAL values (or null if there were none) - never null out or invent a value on the basis of a source you could not read.
 6. Never invent or infer values not explicitly present in the given source text. If uncertain, treat as case 4 (leave blank, flag_text = "No Data Found in Source") rather than guessing.
 7. flag_text must be exactly "Value Correct" whenever the row was already filled in and is verified correct (case 1). For an auto-fill (case 3), flag_text must instead be exactly one of "Filled from HTML", "Filled from PDF", or "Filled from HTML and PDF" (never "Value Correct" for a fill - the source must always be stated). Only use a different flag_text when there is an actual problem: a contradiction (case 2), an access error (case 5), or an unconfirmed pre-existing value (case 4b). For case 4 (nothing found anywhere), flag_text is exactly "No Data Found in Source".
 
@@ -303,7 +304,47 @@ _UOM_CANON = {
     "c": "c", "celsius": "c",
     "f": "f", "fahrenheit": "f",
     "psi": "psi",
+    "sec": "sec", "second": "sec", "seconds": "sec",
+    "min": "min", "minute": "min", "minutes": "min",
+    "hr": "hr", "hour": "hr", "hours": "hr", "hrs": "hr",
+    "day": "day", "days": "day",
+    "yr": "yr", "year": "yr", "years": "yr",
+    "mil": "mil", "mils": "mil",
+    "deg": "deg", "degree": "deg", "degrees": "deg",
+    "oz": "oz", "ounce": "oz", "ounces": "oz",
+    "gal": "gal", "gallon": "gal", "gallons": "gal",
+    "qt": "qt", "quart": "qt", "quarts": "qt",
+    "l": "l", "liter": "l", "liters": "l", "litre": "l", "litres": "l",
+    "ml": "ml", "milliliter": "ml", "milliliters": "ml",
+    "rpm": "rpm", "cfm": "cfm", "gpm": "gpm", "psf": "psf",
+    "db": "db", "lm": "lm", "lumen": "lm", "lumens": "lm",
+    "btu": "btu", "kw": "kw", "kva": "kva", "va": "va", "mah": "mah", "ah": "ah",
+    "vac": "v", "vdc": "v", "kg": "kg",
+    "cu": "cu", "cubic": "cu", "sq": "sq", "square": "sq", "lin": "lin", "linear": "lin",
 }
+
+# Every canonical spelling a unit can normalize to - used as a whitelist when
+# deciding whether an Allowed Values list is a list of MEASUREMENTS at all.
+# Deliberately a whitelist: "1/8 in NPT" and "3/16 Hose Barb" both end in a
+# short word that a shape-based regex would happily accept as a unit, but
+# they are connection types, not measurements.
+_UOM_CANON_VALUES = set(_UOM_CANON.values())
+
+# Multiplicative prefixes that legitimately make a unit two words ("cu ft",
+# "square meter"). Used to tell a real compound unit apart from a controlled
+# vocabulary entry that merely starts with a unit ("in NPT", "Hose Barb").
+_DIM_PREFIXES = {"cu", "cubic", "sq", "square", "lin", "linear"}
+
+# A bare unit-ish token: a short word, optionally with a digit exponent or a
+# "per" denominator ("g/cc", "m3", "ft/min"). Deliberately shape-based rather
+# than a fixed list, so unfamiliar-but-real units still qualify.
+_UNIT_WORD_RE = re.compile(r"^[a-zµ°%]{1,8}[0-9]?(?:\s*/\s*[a-z0-9]{1,8})?$")
+
+# How a Definition typically names the unit an attribute should be recorded in.
+_DEF_UNIT_RE = re.compile(
+    r"(?:measured in|in units of|expressed in|reported in|recorded in|stated in)\s+([a-z.\s/]{1,24})",
+    re.IGNORECASE,
+)
 
 # Any of these appearing in what's supposed to be a bare unit word means
 # Gemini ignored the "single concrete unit word" instruction and wrote a
@@ -330,30 +371,161 @@ def _looks_like_unit_token(s):
 
 
 def _normalize_uom_token(s):
-    s = str(s).strip().lower().rstrip(".").replace("°", "")
-    return _UOM_CANON.get(s, s)
+    """Folds the cosmetic ways the same unit gets written - inch/foot marks,
+    trailing periods ("Cu. Ft."), plurals ("mils", "hours"), case, and
+    spacing - onto one canonical form."""
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    # "°F" -> "f", but a bare "°" is itself the unit (degrees of arc).
+    s = re.sub(r"°\s*(?=[a-z])", "", s)
+    s = s.replace("°", "deg")
+    # Inch/foot marks (including the curly variants real datasheets use).
+    s = s.replace('"', "in").replace("”", "in").replace("″", "in")
+    s = s.replace("'", "ft").replace("’", "ft").replace("′", "ft")
+    s = s.replace(".", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    if s in _UOM_CANON:
+        return _UOM_CANON[s]
+    parts = [_UOM_CANON.get(p, _UOM_CANON.get(p[:-1], p) if p.endswith("s") else p) for p in s.split()]
+    return " ".join(parts)
 
 
 def _uom_equivalent(a, b):
-    return _normalize_uom_token(a) == _normalize_uom_token(b)
+    na, nb = _normalize_uom_token(a), _normalize_uom_token(b)
+    if na == nb:
+        return True
+    # "cu ft" vs "cuft" vs "cu-ft" are the same unit written three ways.
+    squash = lambda x: re.sub(r"[\s\-./]", "", x)
+    return bool(na) and squash(na) == squash(nb)
 
 
-def _resolve_uom_comment(item, data_type=None):
-    """Turns the raw uom_recorded/uom_source pair Gemini reported into the
-    final uom_comment - deterministically, so a same-unit or garbled report
-    can never reach the output (see _UOM_CANON note above). Fixed vocabulary
-    ("UOM Missing" / "UOM Wrong") matches the reference audit output this
-    was modeled on, rather than a freely composed sentence.
+def _is_unit_phrase(s):
+    """True if `s` reads as an actual unit of measure ("in", "g/cc", "cu ft")
+    rather than a vocabulary term that merely contains one ("in NPT")."""
+    n = _normalize_uom_token(s)
+    if not n or n in _UOM_NONUNIT_WORDS:
+        return False
+    if "/" in n and _UNIT_WORD_RE.match(n):
+        return True  # compound rate unit, e.g. "g/cc", "ft/min"
+    toks = n.split()
+    if len(toks) == 1:
+        return toks[0] in _UOM_CANON_VALUES
+    if len(toks) == 2 and toks[0] in _DIM_PREFIXES:
+        return toks[1] in _UOM_CANON_VALUES
+    return False
 
-    Two independent paths: (1) raw_value evidence (uom_source) disagreeing
-    with what's recorded, and (2) a structural check - regardless of any
-    raw_value evidence, a "number" data_type's unit must itself be a real
-    unit of measure, not a dimension qualifier like "ID"/"OD" (reported by
-    the user against a real row where this exact confusion occurred)."""
+
+def _matches_any_unit(recorded, schema_units):
+    """A UOM cell covering a multi-part value repeats its unit once per part
+    ("in; in" alongside a value of "1 1/2; 2 1/8") - correct as long as every
+    part is one of the schema's units."""
+    parts = [p for p in re.split(r"[;,]", str(recorded)) if p.strip()]
+    if not parts:
+        return False
+    return all(any(_uom_equivalent(p, u) for u in schema_units) for p in parts)
+
+
+def _split_allowed_options(allowed_values):
+    """Allowed Values arrives in several real-world shapes: a JSON array
+    ('[ "0.5 g/cc", "0.8 g/cc"]'), a semicolon list ("Round; Oval"), or a
+    comma list. Returns the individual option strings."""
+    if allowed_values is None:
+        return []
+    raw = str(allowed_values).strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(o).strip() for o in parsed if str(o).strip()]
+    except (ValueError, TypeError):
+        pass
+    raw = raw.strip("[]")
+    sep = ";" if ";" in raw else ","
+    return [o.strip().strip('"').strip("'").strip() for o in raw.split(sep) if o.strip(' "\'')]
+
+
+def units_from_allowed_values(allowed_values):
+    """The set of units an Allowed Values list implies, or an empty set when
+    it isn't a unit-bearing list at all.
+
+    "[ '5 sec', '10 min', '24 hr' ]" -> {"sec", "min", "hr"} (any is valid),
+    but "1/8 in NPT; 3/16 Hose Barb" -> {} because those options are named
+    connection types, not measurements - every option must parse as
+    "<amount> <unit>" before the list is trusted as unit evidence.
+    """
+    options = _split_allowed_options(allowed_values)
+    if not options:
+        return set()
+    units = set()
+    for opt in options:
+        # Take whatever trails the last digit - handles "0.5 g/cc", "23.0 cu
+        # ft", ranges like "1 to 2 3/4 in", and "-4°F" alike.
+        last_digit = max((k for k, ch in enumerate(opt) if ch.isdigit()), default=None)
+        if last_digit is None:
+            return set()  # no quantity at all -> a vocabulary of names
+        rest = opt[last_digit + 1:].strip()
+        if not _is_unit_phrase(rest):
+            return set()
+        units.add(_normalize_uom_token(rest))
+    return units
+
+
+def units_from_definition(definition):
+    """Units named outright by the Definition text, e.g. "...capacity of the
+    oven in units of cu. ft." or "...measured in cubic feet"."""
+    if not definition:
+        return set()
+    units = set()
+    for m in _DEF_UNIT_RE.finditer(str(definition)):
+        candidate = m.group(1).strip().rstrip(".").strip()
+        # Trim trailing prose ("cubic feet from the floor" -> "cubic feet").
+        words = candidate.split()
+        for width in (2, 1):
+            if len(words) >= width and _is_unit_phrase(" ".join(words[:width])):
+                units.add(_normalize_uom_token(" ".join(words[:width])))
+                break
+    return units
+
+
+def _resolve_uom_comment(item, data_type=None, allowed_values=None, definition=None, attr_value=None):
+    """Decides the final uom_comment deterministically, from strongest
+    evidence to weakest. Fixed vocabulary ("UOM Missing" / "UOM Wrong")
+    matches the reference audit output this was modeled on.
+
+    Evidence order matters. Allowed Values and Definition describe what unit
+    the SCHEMA requires, so they are authoritative; Raw Value is just how one
+    supplier happened to write it that day, and is routinely a typo
+    ("g/c3" for "g/cc"), an abbreviation ("hours" vs the schema's "hr"), a
+    symbol ('"' vs "in"), or a parenthetical conversion ("8\" (20 cm)").
+    Judging against Raw Value alone is what produced the false "UOM Wrong"
+    reports - every one of those units matched the schema exactly.
+    """
     recorded = item.pop("uom_recorded", None)
     source = item.pop("uom_source", None)
-    if (data_type and str(data_type).strip().lower() == "number"
-            and recorded and not _looks_like_unit_token(recorded)):
+    dtype = str(data_type or "").strip().lower()
+
+    # An attribute with no value has nothing for a unit to qualify. Its Audit
+    # Flag already says so ("No Data Found in Source"); adding "UOM Missing"
+    # on top is duplicate noise on rows that are simply blank.
+    if attr_value is None or not str(attr_value).strip():
+        return None
+
+    schema_units = units_from_allowed_values(allowed_values) or units_from_definition(definition)
+
+    if schema_units:
+        if recorded and _matches_any_unit(recorded, schema_units):
+            return None  # matches what the schema asks for - authoritative
+        return "UOM Missing" if not recorded else "UOM Wrong"
+
+    # Allowed Values exists but names no units at all -> a controlled
+    # vocabulary of terms (e.g. "Round; Oval; Square"). Such an attribute has
+    # no unit to audit, whatever the free text happens to mention nearby.
+    if _split_allowed_options(allowed_values):
+        return None
+
+    if dtype == "number" and recorded and not _looks_like_unit_token(recorded):
         return "UOM Wrong"
     if not source or not _looks_like_unit_token(source):
         return None  # no attributable unit evidence to check against
@@ -362,6 +534,40 @@ def _resolve_uom_comment(item, data_type=None):
     if not _uom_equivalent(recorded, source):
         return "UOM Wrong"
     return None
+
+
+def _row_source_status(manifest, attr):
+    """(any_source_loaded, error_flag_text) for one attribute row, read
+    straight from the manifest's per-source fetch status."""
+    srcs = (attr or {}).get("sources") or {}
+    all_html = (manifest.get("sources") or {}).get("html") or {}
+    all_docs = (manifest.get("sources") or {}).get("docs") or {}
+    first_error = None
+    for h in srcs.get("html") or []:
+        meta = all_html.get(h) or {}
+        if meta.get("status") == "ok":
+            return True, None
+        first_error = first_error or f"HEAD NODE ERROR: {meta.get('error', 'source unavailable')}"
+    for d in srcs.get("docs") or []:
+        meta = all_docs.get((d or {}).get("hash")) or {}
+        if meta.get("status") == "ok":
+            return True, None
+        first_error = first_error or f"PDF ERROR: {meta.get('error', 'document unavailable')}"
+    return False, first_error
+
+
+def _fix_unreadable_source_flag(item, manifest, attr):
+    """"No Data Found in Source" is a factual claim: the sources were read and
+    do not mention this attribute. When every source for the row failed to
+    fetch, that claim is simply false - nothing was read - and it hides an
+    infrastructure problem (an exhausted API plan, a timeout) behind what
+    looks like a clean audit result. The model is told this in case 4/5, but
+    this backstop guarantees it, since the wording is what users act on."""
+    if item.get("flag_text") != "No Data Found in Source":
+        return
+    any_loaded, error_flag = _row_source_status(manifest, attr)
+    if not any_loaded and error_flag:
+        item["flag_text"] = error_flag[:300]
 
 
 def _dedupe_uom_from_flag_text(item, orig_value):
@@ -416,11 +622,14 @@ def _process_one(mpath, results_dir, gemini_key, cache_dir, log, extra_instructi
         log(f"{part}: giving up after retries - {last_err}")
         result = {"error": last_err}
     else:
-        orig_values = {a["row_idx"]: a.get("attr_value") for a in manifest["attributes"]}
-        data_types = {a["row_idx"]: a.get("data_type") for a in manifest["attributes"]}
+        by_row = {a["row_idx"]: a for a in manifest["attributes"]}
         for it in result.get("results", []):
-            it["uom_comment"] = _resolve_uom_comment(it, data_types.get(it.get("row_idx")))
-            _dedupe_uom_from_flag_text(it, orig_values.get(it.get("row_idx")))
+            attr = by_row.get(it.get("row_idx")) or {}
+            it["uom_comment"] = _resolve_uom_comment(
+                it, attr.get("data_type"), attr.get("allowed_values"), attr.get("definition"),
+                attr.get("attr_value"))
+            _fix_unreadable_source_flag(it, manifest, attr)
+            _dedupe_uom_from_flag_text(it, attr.get("attr_value"))
 
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=1)

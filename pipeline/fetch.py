@@ -42,7 +42,11 @@ from bs4 import BeautifulSoup
 
 from pipeline.schema import detect_schema
 
-FETCH_WORKERS = 8
+# Scrape.do enforces a per-plan concurrent-request cap (5 on the entry plans).
+# This used to be 8, which guaranteed a steady stream of HTTP 429s and read
+# timeouts no matter how healthy the account was. run_fetch_phase() lowers it
+# further at runtime if the account reports a smaller cap.
+FETCH_WORKERS = 5
 PDF_PARSE_CONCURRENCY = 4
 PLAYWRIGHT_CONCURRENCY = 5
 
@@ -89,6 +93,18 @@ _index_lock = threading.Lock()
 
 def _index_path(cache_dir: str) -> str:
     return os.path.join(cache_dir, "index.json")
+
+
+def _is_retryable(meta: dict) -> bool:
+    """A cached FAILURE must not be permanent. Fetch errors are usually
+    transient or environmental - an expired/exhausted Scrape.do plan (HTTP
+    401/429), a read timeout, a site that was briefly down. The cache used to
+    return any existing entry regardless of status, so the very first failure
+    for a URL was frozen in forever: re-running the audit, topping up the
+    API plan, or fixing the key changed nothing, and every attribute citing
+    that URL kept reporting as if the source had been read and come up empty.
+    Successful and permanently-unextractable entries still short-circuit."""
+    return (meta or {}).get("status") == "error"
 
 
 def load_index(cache_dir: str) -> dict:
@@ -168,7 +184,19 @@ class DocResult:
     error: str | None = None
 
 
-def fetch_html_scrape_do(url: str, token: str, retries: int = 4, timeout: int = 30) -> HtmlResult:
+def scrape_do_account(token: str, timeout: int = 20) -> dict | None:
+    """Plan status: {IsActive, ConcurrentRequest, MaxMonthlyRequest,
+    RemainingMonthlyRequest}. Returns None if it can't be determined."""
+    try:
+        r = requests.get(f"https://api.scrape.do/info?token={token}", timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def fetch_html_scrape_do(url: str, token: str, retries: int = 4, timeout: int = 60) -> HtmlResult:
     last_err = None
     api_url = _scrape_do_url(url, token)
     for attempt in range(retries + 1):
@@ -177,13 +205,31 @@ def fetch_html_scrape_do(url: str, token: str, retries: int = 4, timeout: int = 
             if r.status_code == 200 and len(r.text) > 200:
                 return HtmlResult(status="ok", text=extract_text_from_html(r.text))
             last_err = f"HTTP {r.status_code}"
+            # 401 here means the plan is exhausted/invalid, not a bad page -
+            # retrying burns time without any chance of succeeding.
+            if r.status_code == 401:
+                return HtmlResult(status="error", error=f"HTTP 401 ({_scrape_do_reason(r)})")
             if r.status_code == 429:
                 time.sleep(6 * (attempt + 1))
                 continue
         except Exception as e:
             last_err = str(e)
+            time.sleep(3 * (attempt + 1))  # back off on timeouts too, not just 429s
+            continue
         time.sleep(1)
     return HtmlResult(status="error", error=last_err)
+
+
+def _scrape_do_reason(response) -> str:
+    try:
+        msg = response.json().get("Message")
+        if isinstance(msg, list):
+            return "; ".join(str(m) for m in msg)[:160]
+        if msg:
+            return str(msg)[:160]
+    except Exception:
+        pass
+    return "check the Scrape.do dashboard"
 
 
 def fetch_doc_scrape_do(url: str, token: str, timeout: int = 30) -> DocResult:
@@ -402,11 +448,34 @@ def run_fetch_phase(
     os.makedirs(manifests_dir, exist_ok=True)
     playwright_pool = None if scrape_do_key else PlaywrightPool()
 
+    # Check the plan BEFORE doing any work. An exhausted plan otherwise fails
+    # every single URL with HTTP 401, and the run still "succeeds" - producing
+    # a full workbook whose every row claims nothing was found in the source.
+    fetch_workers = FETCH_WORKERS
+    if scrape_do_key:
+        acct = scrape_do_account(scrape_do_key)
+        if acct is not None:
+            remaining = acct.get("RemainingMonthlyRequest")
+            concurrent = acct.get("ConcurrentRequest")
+            log(f"Scrape.do plan: {remaining}/{acct.get('MaxMonthlyRequest')} requests remaining this month, "
+                f"{concurrent} concurrent allowed")
+            if isinstance(concurrent, int) and concurrent > 0:
+                fetch_workers = min(fetch_workers, concurrent)
+            if remaining == 0 or acct.get("IsActive") is False:
+                raise ValueError(
+                    "Your Scrape.do plan has no requests left this month "
+                    f"({remaining}/{acct.get('MaxMonthlyRequest')} remaining), so no product page or "
+                    "document could be downloaded. Top up or upgrade the plan at "
+                    "https://dashboard.scrape.do, or clear the Scrape.do key in Settings to use the "
+                    "built-in browser fallback instead. (Running now would flag every attribute as "
+                    "unverifiable.)"
+                )
+
     def fetch_and_cache_html(url, index):
         h = url_hash(url)
         with _index_lock:
             existing = index["html"].get(h)
-        if existing is not None:
+        if existing is not None and not _is_retryable(existing):
             return existing
 
         if scrape_do_key:
@@ -432,7 +501,7 @@ def run_fetch_phase(
         h = url_hash(url)
         with _index_lock:
             existing = index["docs"].get(h)
-        if existing is not None:
+        if existing is not None and not _is_retryable(existing):
             return existing
 
         if scrape_do_key:
@@ -548,10 +617,14 @@ def run_fetch_phase(
                     doc_urls.update(split_urls(row[i]))
 
         index = load_index(cache_dir)
-        html_todo = [u for u in sorted(html_urls) if url_hash(u) not in index["html"]]
-        doc_todo = [u for u in sorted(doc_urls) if url_hash(u) not in index["docs"]]
-        log(f"{len(html_urls)} unique HTML URLs ({len(html_todo)} new), "
-            f"{len(doc_urls)} unique document URLs ({len(doc_todo)} new)")
+        html_todo = [u for u in sorted(html_urls)
+                     if url_hash(u) not in index["html"] or _is_retryable(index["html"][url_hash(u)])]
+        doc_todo = [u for u in sorted(doc_urls)
+                    if url_hash(u) not in index["docs"] or _is_retryable(index["docs"][url_hash(u)])]
+        retry_html = sum(1 for u in html_todo if url_hash(u) in index["html"])
+        retry_doc = sum(1 for u in doc_todo if url_hash(u) in index["docs"])
+        log(f"{len(html_urls)} unique HTML URLs ({len(html_todo)} to fetch, {retry_html} retrying past failures), "
+            f"{len(doc_urls)} unique document URLs ({len(doc_todo)} to fetch, {retry_doc} retrying past failures)")
 
         done = {"n": 0}
         total_todo = len(html_todo) + len(doc_todo)
@@ -590,13 +663,13 @@ def run_fetch_phase(
                     }
             _progress_tick()
 
-        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+        with ThreadPoolExecutor(max_workers=fetch_workers) as ex:
             futures = [ex.submit(_html_task, u) for u in html_todo]
             for fut in as_completed(futures):
                 fut.result()
         save_index(cache_dir, index)
 
-        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+        with ThreadPoolExecutor(max_workers=fetch_workers) as ex:
             futures = [ex.submit(_doc_task, u) for u in doc_todo]
             for fut in as_completed(futures):
                 fut.result()
