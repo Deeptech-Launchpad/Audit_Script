@@ -48,7 +48,7 @@ RULES_PROMPT = """You are independently verifying every product row using the HT
 - attr_label: the attribute name (e.g. "Voltage", "Current").
 - attr_value, attr_uom: the currently recorded Attribute Value and Attribute UOM for this attribute.
 - attr_flag: which source type was previously cited as backing this value (MFR_HTML = the HTML product page, MFR_PDF = a PDF document, MFR_Image = an image, Legacy_Data/Existing_Data = pre-existing data not necessarily sourced from these docs, or blank/None = not sourced).
-- definition, allowed_values, data_type: present on some templates only (null when not available) - see the ADDITIONAL CONTEXT and UOM VALIDATION sections below for how to use them.
+- definition, allowed_values, data_type, raw_value: present on some templates only (null when not available) - see the ADDITIONAL CONTEXT and UOM VALIDATION sections below for how to use them.
 
 You are also given the extracted text of the HTML product page(s) and PDF document(s) associated with this product (labeled by source).
 
@@ -58,6 +58,7 @@ For EACH attribute row, decide:
 1. If the recorded Attribute Value/UOM is directly supported by the source text (exact or clearly equivalent match) -> it is CORRECT. Return final_value/final_uom as an EXACT, VERBATIM COPY of the original attr_value/attr_uom given to you (same text, same abbreviation style, same spelling) - do NOT rephrase, normalize, expand, or abbreviate it (e.g. do not change "Amp" to "A", or "Volt AC/DC" to "V AC/DC") even if the source phrases the unit differently. flag_text = "Value Correct". reasoning may briefly note where it was confirmed.
 2. If the recorded Attribute Value/UOM CONTRADICTS what the source text says (the source explicitly states a DIFFERENT, SUBSTANTIVE value for that same attribute - a different number, a different range, a different named category/color/material) -> it is INCORRECT. Return final_value/final_uom = the CORRECTED value taken verbatim from the source text, and flag_text = a short description of the discrepancy naming the field, e.g. "Attribute Value recorded as 250V but HTML states 230V".
    CRITICAL - do NOT treat these as contradictions (they are case 1, CORRECT, verbatim echo, flag_text = "Value Correct"): mere notation/abbreviation/formatting differences that represent the SAME underlying value. Examples of things that are the SAME (not a contradiction): "Amp" vs "A"; "Volt AC" vs "VAC" vs "V AC"; "3 Phase" vs "3" vs "3PH"; "2 Changeover (SPDT)" vs "2 C/O (SPDT)" vs "2 CO"; "100000 Cycles" vs "100000 Operations"; different digit grouping/spacing/capitalization of the same number or word. Only flag a contradiction when the actual substantive value differs (e.g. a different number, a different named color, a different specific rating) - not when it's the same value written in different shorthand.
+   This also covers unit-conversion equivalence: if the recorded number, converted using the standard conversion factor between its own unit and a different unit the source states, equals the source's number for that same measurement (e.g. 3.5 in = 88.9 mm), the underlying physical value is the SAME, not a contradiction - treat it as case 1: final_value/final_uom = verbatim echo of the original, flag_text = exactly "Value Correct" (do NOT describe the unit discrepancy in flag_text - that is the separate UOM VALIDATION section's job below, never this one's). Only treat it as a genuine case-2 contradiction when no such unit conversion reconciles the two numbers.
 3. If attr_value is empty/missing AND the correct value IS explicitly present in the source text -> FILL IT. Return final_value/final_uom = the value found in the source. This is NOT a problem, but you MUST still record where the value came from so it can be verified: set flag_text to "Filled from HTML" if only the HTML page stated it, "Filled from PDF" if only a PDF document stated it, or "Filled from HTML and PDF" if both independently confirm it. Always name the source type this way for every auto-fill - never leave flag_text null for a fill.
 4. If attr_value is empty/missing AND the value is NOT found in any available source -> leave final_value/final_uom = null, and set flag_text = "No Data Found in Source". Never guess or generate information that is not explicitly available.
 4b. IMPORTANT: If attr_value/attr_uom already has a recorded value, and that specific value is simply NOT MENTIONED anywhere in the available source text (this is different from case 2 - there is no explicit contradicting value, the topic is just absent from what you were given) -> do NOT null it out. This is not necessarily wrong; our source excerpt may simply be incomplete. Return final_value = the ORIGINAL attr_value unchanged, final_uom = the ORIGINAL attr_uom unchanged, and flag_text = a short note such as "Could not verify Attribute Value against available sources" so a human can double check. Only use case 2 (correction) when the source gives an explicit, specific, conflicting value for that exact attribute.
@@ -68,15 +69,26 @@ For EACH attribute row, decide:
 === ADDITIONAL CONTEXT (only when definition/allowed_values/data_type are not null - CONTEXT ONLY, does not change cases 1-7 above) ===
 Some templates also provide, per attribute:
 - definition: what this attribute is intended to represent.
-- allowed_values: a documented list of valid options for this attribute, when it has a fixed/controlled vocabulary.
+- allowed_values: a documented list of valid options for this attribute, when it has a fixed/controlled vocabulary (e.g. "1/8 in NPT; 3/16 Hose Barb; 1/4 in NPT; 3/8 in Hose Barb").
 - data_type: "number" or "text", the expected kind of value.
-Use these ONLY to understand an ambiguous attr_label, or to know which of several allowed options the source is confirming when correcting a case-2 contradiction. They must NOT make you more willing to flag something as incorrect, uncertain, or worth commenting on than you would be under cases 1-7 alone. If definition/allowed_values/data_type are null, or don't clearly resolve something, that is not itself a problem - proceed exactly as if this section did not exist.
+Use definition/data_type ONLY to understand an ambiguous attr_label - they must NOT make you more willing to flag something as incorrect, uncertain, or worth commenting on than you would be under cases 1-7 alone. If they're null or don't clearly resolve something, proceed exactly as if this part of the section did not exist.
 
-=== UOM VALIDATION (a SEPARATE, OPTIONAL annotation - must have ZERO effect on final_value, final_uom, or flag_text, which are decided purely by cases 1-7 above) ===
-Populate BOTH uom_recorded and uom_source (each a single short concrete unit word/symbol, e.g. "mm", "in", "A" - never a sentence or description) ONLY when ALL of the following are true:
-1. The recorded data has an actual, specific, named unit - either in attr_uom, or unambiguously embedded in attr_value's text (e.g. "1/4 in", "10 ft").
-2. The source text (or definition) explicitly and unambiguously states a DIFFERENT specific named unit for that exact same measurement - not a description, not a category name, and not silence on the topic.
-In every other situation, leave BOTH uom_recorded and uom_source null - do not fill in just one. This includes: attr_uom is simply blank/not recorded (normal for many attributes, not itself a "mismatch" to report), the source does not explicitly mention a unit at all, you are unsure, or the source disagrees with the VALUE (already handled by case 2 above) rather than specifically the unit. Never write a vague phrase in place of an actual unit (e.g. never write "no unit", "embedded in value", or any multi-word description into either field) - if you cannot name two concrete, specific unit words, leave both null. Whether the two units you name actually differ (e.g. "A" and "Amp" are the same unit, not a mismatch) is checked separately after your response - just report the two literal unit words/symbols you found on each side, verbatim, without judging equivalence yourself.
+allowed_values is different: when present, it is a hard schema-conformance requirement for that attribute, checked BEFORE cases 1-7:
+- If the recorded attr_value/attr_uom together correspond to one of the listed options (exactly, or via a clear equivalent/synonym/notation variant per the case 2 CRITICAL note) -> proceed to cases 1-7 as normal (source-check it like any other attribute).
+- If they do NOT correspond to any listed option, and no source explicitly confirms one of the LISTED OPTIONS ITSELF as the correct value -> leave final_value/final_uom UNCHANGED (do not guess which option was intended) and set flag_text = exactly "Wrong Value based on the Schema Definition and allowed value". This is the default whenever the recorded value doesn't match the list - a source saying something else true and specific ABOUT the attribute, that is still not itself one of the listed options, does NOT count as confirming an option; it still falls in this bullet.
+- Only if a source explicitly states a value matching one of the allowed_values options THEMSELVES (word-for-word or a clear equivalent/synonym) -> follow case 2 instead (final_value/final_uom = that confirmed option, flag_text = the usual discrepancy sentence).
+When allowed_values governs an attribute this way, never separately populate uom_recorded/uom_source for it below - this check already covers its correctness completely.
+
+=== UOM VALIDATION (a SEPARATE, OPTIONAL annotation - must have ZERO effect on final_value, final_uom, or flag_text, which are decided purely by cases 1-7 and the allowed_values check above) ===
+flag_text must NEVER mention a unit/UOM discrepancy, even when that's the only issue found for the row (e.g. even the unit-conversion case just above still gets flag_text = "Value Correct", nothing more) - a unit problem is reported ONLY through uom_recorded/uom_source below, never through flag_text.
+
+This check is based ENTIRELY on raw_value compared against this same row's own attr_value/attr_uom - it is a self-contained, same-row check. Never use the HTML/PDF source text for this section; that text is not needed here and must be ignored for this specific check (it may be exactly what confirmed case 1/2 above, but does not feed uom_source).
+
+This only ever applies to an attribute whose value is fundamentally a QUANTITY - a number, a numeric range, or a fraction that measures something (e.g. a current rating, a length, a voltage) - and only when allowed_values is null for it (an attribute governed by allowed_values is fully covered above and must never get uom_recorded/uom_source here). Never apply this to an attribute whose value is a name, category, color, material, or other non-numeric descriptor - those have no unit to check, no matter what words happen to appear nearby in raw_value.
+
+When it applies, use raw_value as the ground truth for what unit THIS SPECIFIC attribute should have. raw_value is sometimes a longer passage describing the whole product (covering several attributes at once) - only use a unit from it when it unambiguously belongs to this attribute's own measurement (e.g. its number matches attr_value's number), never one that happens to describe a different attribute mentioned nearby in the same text. If raw_value is null, doesn't mention a unit, or its unit can't be clearly attributed to this attribute, there is nothing to check - leave both fields null.
+
+Populate uom_source with the single concrete unit word/symbol raw_value states for this attribute (e.g. "A", "V", "in"). Then populate uom_recorded by checking BOTH places a unit could currently be captured - attr_uom, AND any unit embedded directly inside attr_value's own text (e.g. attr_value "600 V" embeds unit "V" even though attr_uom is null - that counts as recorded, check both before concluding nothing is there). Only leave uom_recorded null if genuinely no unit appears in EITHER place. Never write a sentence, description, or vague phrase into either field (e.g. never "no unit", "embedded in value") - only a short literal unit token, or null. Whether uom_recorded and uom_source actually differ (e.g. "A" and "Amp" are the same unit) is checked separately after your response - just report what you literally find on each side.
 
 Respond with a JSON object matching the required schema, one entry per attribute row_idx you were given (do not skip any).
 """
@@ -202,6 +214,7 @@ def build_prompt(manifest, texts, errors, cache_dir, extra_instructions=None):
             "definition": attr.get("definition"),
             "allowed_values": attr.get("allowed_values"),
             "data_type": attr.get("data_type"),
+            "raw_value": attr.get("raw_value"),
         }
         extra_excerpts = []
         for d in attr["sources"]["docs"]:
@@ -327,14 +340,38 @@ def _uom_equivalent(a, b):
 
 def _resolve_uom_comment(item):
     """Turns the raw uom_recorded/uom_source pair Gemini reported into the
-    final uom_comment string, or None - deterministically, so a same-unit or
-    garbled report can never reach the output (see _UOM_CANON note above)."""
+    final uom_comment - deterministically, so a same-unit or garbled report
+    can never reach the output (see _UOM_CANON note above). Fixed vocabulary
+    ("UOM Missing" / "UOM Wrong") matches the reference audit output this
+    was modeled on, rather than a freely composed sentence."""
     recorded = item.pop("uom_recorded", None)
     source = item.pop("uom_source", None)
-    if (recorded and source and _looks_like_unit_token(recorded) and _looks_like_unit_token(source)
-            and not _uom_equivalent(recorded, source)):
-        return f"UOM recorded as {recorded} but source indicates {source}"
+    if not source or not _looks_like_unit_token(source):
+        return None  # no attributable unit evidence to check against
+    if not recorded or not _looks_like_unit_token(recorded):
+        return "UOM Missing"
+    if not _uom_equivalent(recorded, source):
+        return "UOM Wrong"
     return None
+
+
+def _dedupe_uom_from_flag_text(item, orig_value):
+    """Backstop for a persistent model tendency: even when explicitly told
+    flag_text must never describe a unit-only discrepancy, it sometimes does
+    anyway for a row whose uom_comment already says "UOM Wrong" (reproduced
+    in testing against the reference file's own unit-conversion example,
+    e.g. 3.5 in == 88.9 mm). Only overrides when final_value didn't actually
+    change from what was recorded - i.e. this really is a pure unit
+    mislabeling (case 1), never a genuine case-2 value correction that
+    happens to also mention "UOM"."""
+    if item.get("uom_comment") != "UOM Wrong":
+        return
+    flag = (item.get("flag_text") or "").lower()
+    def _norm(v):
+        return str(v).strip() if v is not None else ""
+
+    if "uom" in flag and _norm(item.get("final_value")) == _norm(orig_value):
+        item["flag_text"] = "Value Correct"
 
 
 def _process_one(mpath, results_dir, gemini_key, cache_dir, log, extra_instructions=None):
@@ -370,8 +407,10 @@ def _process_one(mpath, results_dir, gemini_key, cache_dir, log, extra_instructi
         log(f"{part}: giving up after retries - {last_err}")
         result = {"error": last_err}
     else:
+        orig_values = {a["row_idx"]: a.get("attr_value") for a in manifest["attributes"]}
         for it in result.get("results", []):
             it["uom_comment"] = _resolve_uom_comment(it)
+            _dedupe_uom_from_flag_text(it, orig_values.get(it.get("row_idx")))
 
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=1)

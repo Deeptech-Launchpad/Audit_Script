@@ -118,6 +118,11 @@ def detect_schema(header_row):
     definition_idx = find_exact("definition")
     allowed_values_idx = find_exact("allowed values")
     data_type_idx = find_exact("data type")
+    # The original, unnormalized source text an attribute's value was parsed
+    # from (e.g. "Amperage 30A - 100A" for a Build Value of "30 to 100" with
+    # no UOM recorded) - the most direct in-row evidence of what unit an
+    # attribute should carry, when present.
+    raw_value_idx = find_exact("raw value")
 
     if attr_section_idx is None:
         # Fallback: derive from attr_label/value position if the exact label differs.
@@ -191,6 +196,7 @@ def detect_schema(header_row):
         "definition_idx": definition_idx,
         "allowed_values_idx": allowed_values_idx,
         "data_type_idx": data_type_idx,
+        "raw_value_idx": raw_value_idx,
         "audit_flag_idx": n,  # append new column right after the last existing one
         "uom_comments_idx": n + 1,  # append right after Audit Flag
     }

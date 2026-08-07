@@ -167,3 +167,30 @@ def test_deeptech_template_sources_and_page_hints():
     # so an exact-match pairing would silently miss it.
     assert doc_by_name["Third Party PDF URL"] == "Third Party PDF Page#"
     assert "Certfications/Standards 1" in doc_by_name  # typo'd keyword still lands in doc_idx via the fallback branch
+
+
+def test_deeptech_template_raw_value_detected_as_its_own_field():
+    """"Raw Value" is never one of the core attr_* fields (see above), but it
+    IS its own optional enrichment field - needed as UOM-check evidence."""
+    header = _deeptech_template_header()
+    schema = detect_schema(header)
+    assert header[schema["raw_value_idx"]] == "Raw Value"
+
+
+def _enrichment_header():
+    """pilot_Audit_Data_Sample_Input1/23.xlsx add Definition/Allowed Values/
+    Data Type ahead of Raw Value/Build Value."""
+    return [
+        "SKU", "Attribute Section", "Attribute Name", "Definition", "Allowed Values", "Data Type",
+        "Raw Value", "Build Value", "UOM", "Source Flag", "Status",
+    ]
+
+
+def test_enrichment_columns_detected():
+    header = _enrichment_header()
+    schema = detect_schema(header)
+    assert header[schema["definition_idx"]] == "Definition"
+    assert header[schema["allowed_values_idx"]] == "Allowed Values"
+    assert header[schema["data_type_idx"]] == "Data Type"
+    assert header[schema["raw_value_idx"]] == "Raw Value"
+    assert header[schema["attr_value_idx"]] == "Build Value"

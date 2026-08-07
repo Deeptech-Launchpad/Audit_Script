@@ -636,6 +636,7 @@ def run_fetch_phase(
                     "definition": row[schema["definition_idx"]] if schema["definition_idx"] is not None else None,
                     "allowed_values": row[schema["allowed_values_idx"]] if schema["allowed_values_idx"] is not None else None,
                     "data_type": row[schema["data_type_idx"]] if schema["data_type_idx"] is not None else None,
+                    "raw_value": row[schema["raw_value_idx"]] if schema["raw_value_idx"] is not None else None,
                     "sources": row_sources,
                 })
             manifest = {"product": product_info, "sources": sources, "attributes": attrs}
