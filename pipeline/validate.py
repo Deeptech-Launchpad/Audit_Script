@@ -82,13 +82,13 @@ When allowed_values governs an attribute this way, never separately populate uom
 === UOM VALIDATION (a SEPARATE, OPTIONAL annotation - must have ZERO effect on final_value, final_uom, or flag_text, which are decided purely by cases 1-7 and the allowed_values check above) ===
 flag_text must NEVER mention a unit/UOM discrepancy, even when that's the only issue found for the row (e.g. even the unit-conversion case just above still gets flag_text = "Value Correct", nothing more) - a unit problem is reported ONLY through uom_recorded/uom_source below, never through flag_text.
 
-This check is based ENTIRELY on raw_value compared against this same row's own attr_value/attr_uom - it is a self-contained, same-row check. Never use the HTML/PDF source text for this section; that text is not needed here and must be ignored for this specific check (it may be exactly what confirmed case 1/2 above, but does not feed uom_source).
-
 This only ever applies to an attribute whose value is fundamentally a QUANTITY - a number, a numeric range, or a fraction that measures something (e.g. a current rating, a length, a voltage) - and only when allowed_values is null for it (an attribute governed by allowed_values is fully covered above and must never get uom_recorded/uom_source here). Never apply this to an attribute whose value is a name, category, color, material, or other non-numeric descriptor - those have no unit to check, no matter what words happen to appear nearby in raw_value.
 
-When it applies, use raw_value as the ground truth for what unit THIS SPECIFIC attribute should have. raw_value is sometimes a longer passage describing the whole product (covering several attributes at once) - only use a unit from it when it unambiguously belongs to this attribute's own measurement (e.g. its number matches attr_value's number), never one that happens to describe a different attribute mentioned nearby in the same text. If raw_value is null, doesn't mention a unit, or its unit can't be clearly attributed to this attribute, there is nothing to check - leave both fields null.
+When it applies, ALWAYS populate uom_recorded by checking BOTH places a unit could currently be captured - attr_uom, AND any unit embedded directly inside attr_value's own text (e.g. attr_value "600 V" embeds unit "V" even though attr_uom is null; attr_value "1/8 through 1/4 ID" embeds "ID" at the end even though it isn't a real unit - report it anyway, verbatim, and let the automatic check decide whether it's valid). Only leave uom_recorded null if genuinely no unit-like token appears in EITHER place. Report whatever is actually there verbatim, even if it looks wrong to you - never write a sentence, description, or vague phrase into it (e.g. never "no unit", "embedded in value") - only a short literal token, or null.
 
-Populate uom_source with the single concrete unit word/symbol raw_value states for this attribute (e.g. "A", "V", "in"). Then populate uom_recorded by checking BOTH places a unit could currently be captured - attr_uom, AND any unit embedded directly inside attr_value's own text (e.g. attr_value "600 V" embeds unit "V" even though attr_uom is null - that counts as recorded, check both before concluding nothing is there). Only leave uom_recorded null if genuinely no unit appears in EITHER place. Never write a sentence, description, or vague phrase into either field (e.g. never "no unit", "embedded in value") - only a short literal unit token, or null. Whether uom_recorded and uom_source actually differ (e.g. "A" and "Amp" are the same unit) is checked separately after your response - just report what you literally find on each side.
+Separately, use raw_value as ground truth for what unit THIS SPECIFIC attribute should have, when available. raw_value is sometimes a longer passage describing the whole product (covering several attributes at once) - only use a unit from it when it unambiguously belongs to this attribute's own measurement (e.g. its number matches attr_value's number), never one that happens to describe a different attribute mentioned nearby in the same text. If raw_value is null, doesn't mention a unit, or its unit can't be clearly attributed to this attribute, leave uom_source null - that alone does not block uom_recorded above from being populated. Never use the HTML/PDF source text for uom_source; that text is not needed here and must be ignored for this specific check (it may be exactly what confirmed case 1/2 above, but does not feed uom_source).
+
+Whether uom_recorded and uom_source actually differ (e.g. "A" and "Amp" are the same unit), and whether uom_recorded is even a real unit of measure at all when data_type is "number" (e.g. "ID"/"OD" are dimension qualifiers, not units, and are wrong for a number-type attribute regardless of raw_value), is all checked automatically after your response - just report what you literally find, verbatim, without judging validity or equivalence yourself.
 
 Respond with a JSON object matching the required schema, one entry per attribute row_idx you were given (do not skip any).
 """
@@ -338,14 +338,23 @@ def _uom_equivalent(a, b):
     return _normalize_uom_token(a) == _normalize_uom_token(b)
 
 
-def _resolve_uom_comment(item):
+def _resolve_uom_comment(item, data_type=None):
     """Turns the raw uom_recorded/uom_source pair Gemini reported into the
     final uom_comment - deterministically, so a same-unit or garbled report
     can never reach the output (see _UOM_CANON note above). Fixed vocabulary
     ("UOM Missing" / "UOM Wrong") matches the reference audit output this
-    was modeled on, rather than a freely composed sentence."""
+    was modeled on, rather than a freely composed sentence.
+
+    Two independent paths: (1) raw_value evidence (uom_source) disagreeing
+    with what's recorded, and (2) a structural check - regardless of any
+    raw_value evidence, a "number" data_type's unit must itself be a real
+    unit of measure, not a dimension qualifier like "ID"/"OD" (reported by
+    the user against a real row where this exact confusion occurred)."""
     recorded = item.pop("uom_recorded", None)
     source = item.pop("uom_source", None)
+    if (data_type and str(data_type).strip().lower() == "number"
+            and recorded and not _looks_like_unit_token(recorded)):
+        return "UOM Wrong"
     if not source or not _looks_like_unit_token(source):
         return None  # no attributable unit evidence to check against
     if not recorded or not _looks_like_unit_token(recorded):
@@ -408,8 +417,9 @@ def _process_one(mpath, results_dir, gemini_key, cache_dir, log, extra_instructi
         result = {"error": last_err}
     else:
         orig_values = {a["row_idx"]: a.get("attr_value") for a in manifest["attributes"]}
+        data_types = {a["row_idx"]: a.get("data_type") for a in manifest["attributes"]}
         for it in result.get("results", []):
-            it["uom_comment"] = _resolve_uom_comment(it)
+            it["uom_comment"] = _resolve_uom_comment(it, data_types.get(it.get("row_idx")))
             _dedupe_uom_from_flag_text(it, orig_values.get(it.get("row_idx")))
 
     with open(result_path, "w", encoding="utf-8") as f:

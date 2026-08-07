@@ -118,6 +118,58 @@ def test_value_correct_wording_not_bare_correct(workbook_env):
     assert stats["confirmed_ok"] == 2
 
 
+def test_correction_never_overwrites_build_value_or_uom(workbook_env):
+    """A detected correction to an EXISTING value must be reported only via
+    Audit Flag - the Build Value/UOM cells themselves are never touched,
+    even when the model returns a different final_value/final_uom."""
+    _write_result(workbook_env["results_dir"], "SKU-1", [
+        {"row_idx": 2, "final_value": "230", "final_uom": "V", "flag_text": "Value Correct", "uom_comment": None},
+        {"row_idx": 3, "final_value": None, "final_uom": None, "flag_text": "No Data Found in Source", "uom_comment": None},
+        {"row_idx": 4, "final_value": "800", "final_uom": "mm", "flag_text": "Attribute Value recorded as 10 but PDF states 800",
+         "uom_comment": None},
+    ])
+    output_path = os.path.join(workbook_env["tmp_path"], "out3.xlsx")
+    stats = run_writeback_phase(
+        input_path=workbook_env["input_path"], output_path=output_path,
+        results_dir=workbook_env["results_dir"], manifests_dir=workbook_env["manifests_dir"], sheet="Sheet1",
+    )
+    wb = openpyxl.load_workbook(output_path, data_only=True)
+    ws = wb["Sheet1"]
+    header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    audit_flag_col = len(header) - 1
+    value_col = header.index("Attribute Value") + 1
+    uom_col = header.index("UOM") + 1
+
+    # Original Build Value/UOM untouched...
+    assert ws.cell(row=4, column=value_col).value == "10"
+    assert ws.cell(row=4, column=uom_col).value == "mm"
+    # ...but the discrepancy is still reported via Audit Flag.
+    assert ws.cell(row=4, column=audit_flag_col).value == "Attribute Value recorded as 10 but PDF states 800"
+    assert stats["corrected"] == 1
+
+
+def test_fill_of_genuinely_blank_value_still_writes_cell(workbook_env):
+    """Filling in a value that was genuinely blank is not a "correction" to
+    an existing value - that still writes through, unlike the case above."""
+    _write_result(workbook_env["results_dir"], "SKU-1", [
+        {"row_idx": 2, "final_value": "230", "final_uom": "V", "flag_text": "Value Correct", "uom_comment": None},
+        {"row_idx": 3, "final_value": "5", "final_uom": "kg", "flag_text": "Filled from PDF", "uom_comment": None},
+        {"row_idx": 4, "final_value": "10", "final_uom": "mm", "flag_text": "Value Correct", "uom_comment": None},
+    ])
+    output_path = os.path.join(workbook_env["tmp_path"], "out4.xlsx")
+    run_writeback_phase(
+        input_path=workbook_env["input_path"], output_path=output_path,
+        results_dir=workbook_env["results_dir"], manifests_dir=workbook_env["manifests_dir"], sheet="Sheet1",
+    )
+    wb = openpyxl.load_workbook(output_path, data_only=True)
+    ws = wb["Sheet1"]
+    header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    value_col = header.index("Attribute Value") + 1
+    uom_col = header.index("UOM") + 1
+    assert ws.cell(row=3, column=value_col).value == "5"
+    assert ws.cell(row=3, column=uom_col).value == "kg"
+
+
 def test_mislabeled_fill_downgrades_to_no_data_found(workbook_env):
     """Same backstop as before (a "Filled from X" marker where nothing was
     actually filled), just with the updated wording."""

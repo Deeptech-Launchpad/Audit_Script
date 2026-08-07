@@ -59,6 +59,26 @@ def test_resolve_uom_comment_none_when_no_source_evidence():
     assert _resolve_uom_comment({"uom_recorded": "mm", "uom_source": None}) is None
 
 
+def test_resolve_uom_comment_wrong_for_non_unit_on_number_data_type():
+    """Reported by the user against a real row: data_type="number" but the
+    recorded unit is "ID" (inner diameter - a dimension qualifier, not a
+    unit) - must be "UOM Wrong" even with no raw_value evidence at all."""
+    item = {"uom_recorded": "ID", "uom_source": None}
+    assert _resolve_uom_comment(item, data_type="number") == "UOM Wrong"
+
+
+def test_resolve_uom_comment_non_unit_ignored_for_text_data_type():
+    """The structural number-data-type check must not fire for other data
+    types - a "text" attribute may legitimately embed non-unit qualifiers."""
+    item = {"uom_recorded": "ID", "uom_source": None}
+    assert _resolve_uom_comment(item, data_type="text") is None
+
+
+def test_resolve_uom_comment_real_unit_on_number_data_type_is_fine():
+    item = {"uom_recorded": "mm", "uom_source": None}
+    assert _resolve_uom_comment(item, data_type="number") is None
+
+
 def test_resolve_uom_comment_none_when_source_is_not_a_real_unit():
     item = {"uom_recorded": "in", "uom_source": "ID"}
     assert _resolve_uom_comment(item) is None

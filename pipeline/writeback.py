@@ -1,11 +1,12 @@
 """
 Write-back phase: write validation results into a COPY of the original
-workbook. The original file is never touched. Classification logic (the
-safety-net "only a real correction or a fill may write Z/AA", the
-is_same_substance() notation-difference backstop, the "Filled from X"
-mislabel downgrade, and the openpyxl None-clear gotcha) is unchanged from
-the CLI pipeline - each one was a real bug found and fixed against
-production data.
+workbook. The original file is never touched. Build Value/UOM themselves are
+only ever filled in when genuinely blank - a detected correction to an
+EXISTING value is reported only through Audit Flag/UOM Comments, never by
+overwriting the cell. Other classification logic (the is_same_substance()
+notation-difference backstop, the "Filled from X" mislabel downgrade, and the
+openpyxl None-clear gotcha) is unchanged from the CLI pipeline - each one was
+a real bug found and fixed against production data.
 """
 import glob
 import json
@@ -147,6 +148,9 @@ def run_writeback_phase(input_path, output_path, results_dir, manifests_dir, she
                                    and not is_marked_correct and not is_filled_marker and not is_no_data_found)
             fill_write = not orig_value
 
+            # allow_write no longer permits writing a correction into Z/AA
+            # (see below) - it's kept only to drive this notation-difference
+            # downgrade, which still matters for flag_text/stats.
             allow_write = is_real_correction
 
             if allow_write and not fill_write and is_same_substance(orig_value, orig_uom, final_value, final_uom):
@@ -177,7 +181,10 @@ def run_writeback_phase(input_path, output_path, results_dir, manifests_dir, she
             else:
                 stats["confirmed_ok"] += 1
 
-            if fill_write or allow_write:
+            # Build Value/UOM are only ever filled in when genuinely blank -
+            # a detected correction to an EXISTING value is reported only via
+            # Audit Flag/UOM Comments below; the cell itself is never touched.
+            if fill_write:
                 # openpyxl's ws.cell(value=...) is a silent no-op when value=None,
                 # so an intentional clear needs direct attribute assignment.
                 if new_value != orig_value:
