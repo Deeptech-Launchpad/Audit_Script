@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: audit-pipeline
+    runtime: python
+    region: oregon   # change to: frankfurt | singapore | ohio | virginia
+    plan: starter    # starter = $7/mo; upgrade to standard for more RAM/CPU
+
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      python -m playwright install chromium
+      python -m playwright install-deps chromium
+
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+
+    envVars:
+      - key: STORAGE_ROOT
+        value: /var/data/audit_storage   # maps to the persistent disk below
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+
+    disk:
+      name: audit-storage
+      mountPath: /var/data/audit_storage
+      sizeGB: 10   # increase if your cache/jobs dirs grow large

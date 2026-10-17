@@ -5,12 +5,19 @@ File-based cache (storage/cache/index.json + storage/cache/html|docs/*) -
 same approach as the original CLI scripts, kept deliberately simple (no
 database) since this app runs as a single process for one team/user.
 
-Two fetch methods, selected once per run:
-  - Scrape.do (if the user supplied a key): proxy-based HTTP fetch, handles
-    anti-bot-protected sites. Logic unchanged from the original script.
-  - Playwright (fallback, no key required): a real headless Chromium browser.
-    Both paths funnel through the same extract_text_from_html() so
-    validation/write-back never need to know which one ran.
+Three fetch strategies, applied in priority order:
+  1. Scrape.do dedupe/moat cache  (zero credits consumed)
+       GET /moat/scraped?url=<url>              → check if already scraped
+       GET /moat/scraped/content?url=<url>      → retrieve cached text
+     Used first whenever a Scrape.do key is provided, regardless of whether
+     the plan still has live-scraping credits.  If the URL was previously
+     scraped by ANY job on the account it lands here for free.
+  2. Scrape.do live proxy  (consumes credits, only if plan has remaining)
+     proxy-based HTTP fetch, handles anti-bot-protected sites.
+  3. Playwright fallback  (no key required, or when plan is exhausted)
+     A real headless Chromium browser.
+     All paths funnel through the same extract_text_from_html() so
+     validation/write-back never need to know which one ran.
 """
 import asyncio
 import json
@@ -161,13 +168,97 @@ def pdf_pages(raw_path: str, lo: int, hi: int, timeout: int = 60) -> dict:
 
 # ---------------------------------------------------------------- Scrape.do
 
+SCRAPE_DO_API_BASE = "https://api.scrape.do"
+SCRAPE_DO_MOAT_BASE = "https://api.scrape.do"  # same base; /moat/* endpoints live here
+
+
 def _bounded_get(url, timeout, **kwargs):
     fut = _net_executor.submit(requests.get, url, timeout=timeout, **kwargs)
     return fut.result(timeout=timeout + 10)
 
 
 def _scrape_do_url(url: str, token: str) -> str:
-    return "https://api.scrape.do/?token=" + token + "&url=" + urllib.parse.quote(url, safe="")
+    return f"{SCRAPE_DO_API_BASE}/?token={token}&url={urllib.parse.quote(url, safe='')}"
+
+
+# ---- Scrape.do dedupe / moat cache helpers (zero-credit lookups) ----
+
+def scrape_do_is_cached(url: str, token: str, timeout: int = 15) -> bool:
+    """Returns True if Scrape.do's moat store already has this URL scraped.
+    Uses GET /moat/scraped?url=<url> with X-API-Key header.
+    Never raises; any error is treated as "not cached"."""
+    try:
+        endpoint = f"{SCRAPE_DO_MOAT_BASE}/moat/scraped"
+        r = _bounded_get(
+            endpoint,
+            timeout=timeout,
+            params={"url": url},
+            headers={"X-API-Key": token},
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return bool(data.get("scraped"))
+        return False
+    except Exception:
+        return False
+
+
+def scrape_do_get_cached_text(url: str, token: str, timeout: int = 30) -> HtmlResult:
+    """Fetches already-scraped text from Scrape.do's moat cache.
+    Uses GET /moat/scraped/content?url=<url> with X-API-Key header.
+    Returns HtmlResult(status='ok') on success, HtmlResult(status='error') otherwise.
+    Consumes ZERO scraping credits."""
+    try:
+        endpoint = f"{SCRAPE_DO_MOAT_BASE}/moat/scraped/content"
+        r = _bounded_get(
+            endpoint,
+            timeout=timeout,
+            params={"url": url},
+            headers={"X-API-Key": token},
+        )
+        if r.status_code == 404:
+            return HtmlResult(status="error", error="URL not in Scrape.do cache (404)")
+        if r.status_code == 200:
+            raw = r.text or ""
+            # The /moat/scraped/content endpoint returns the raw HTML/text
+            # that was captured at scrape time.  Strip HTML tags if present.
+            if raw.lstrip().startswith("<"):
+                text = extract_text_from_html(raw)
+            else:
+                text = raw
+            if len(text) > 50:
+                return HtmlResult(status="ok", text=text)
+            return HtmlResult(status="error", error="Cached content too short to be useful")
+        return HtmlResult(status="error", error=f"Moat cache HTTP {r.status_code}")
+    except Exception as e:
+        return HtmlResult(status="error", error=f"Moat cache fetch error: {e}")
+
+
+def fetch_html_with_moat_fallback(
+    url: str,
+    token: str,
+    plan_exhausted: bool = False,
+    log=None,
+) -> tuple[HtmlResult, str]:
+    """Cache-first HTML fetch strategy:
+      1. Try Scrape.do moat cache (free, no credits).
+      2. If not cached and plan has credits → live Scrape.do proxy.
+      3. If not cached and plan exhausted → return error (caller falls back to Playwright).
+    Returns (HtmlResult, method_label)."""
+    # Step 1: check moat cache
+    cached_result = scrape_do_get_cached_text(url, token)
+    if cached_result.status == "ok":
+        return cached_result, "scrape_do_moat_cache"
+
+    if plan_exhausted:
+        return HtmlResult(
+            status="error",
+            error="Scrape.do plan exhausted and URL not in moat cache — falling back to Playwright",
+        ), "scrape_do_moat_cache"
+
+    # Step 2: live scrape
+    result = fetch_html_scrape_do(url, token)
+    return result, "scrape_do_live"
 
 
 @dataclass
@@ -446,30 +537,35 @@ def run_fetch_phase(
     import openpyxl
 
     os.makedirs(manifests_dir, exist_ok=True)
-    playwright_pool = None if scrape_do_key else PlaywrightPool()
+    plan_exhausted = False  # True when Scrape.do credits are at 0; moat cache + Playwright take over
+    playwright_pool = None  # created lazily below if/when needed
 
-    # Check the plan BEFORE doing any work. An exhausted plan otherwise fails
-    # every single URL with HTTP 401, and the run still "succeeds" - producing
-    # a full workbook whose every row claims nothing was found in the source.
+    # Check the plan BEFORE doing any work.  An exhausted plan no longer
+    # hard-fails: we instead activate "moat-cache + Playwright" mode so
+    # already-scraped URLs are retrieved free-of-charge and any URL that
+    # isn't in the moat cache is handled by the headless browser fallback.
     fetch_workers = FETCH_WORKERS
     if scrape_do_key:
         acct = scrape_do_account(scrape_do_key)
         if acct is not None:
             remaining = acct.get("RemainingMonthlyRequest")
             concurrent = acct.get("ConcurrentRequest")
+            is_active = acct.get("IsActive", True)
             log(f"Scrape.do plan: {remaining}/{acct.get('MaxMonthlyRequest')} requests remaining this month, "
                 f"{concurrent} concurrent allowed")
             if isinstance(concurrent, int) and concurrent > 0:
                 fetch_workers = min(fetch_workers, concurrent)
-            if remaining == 0 or acct.get("IsActive") is False:
-                raise ValueError(
-                    "Your Scrape.do plan has no requests left this month "
-                    f"({remaining}/{acct.get('MaxMonthlyRequest')} remaining), so no product page or "
-                    "document could be downloaded. Top up or upgrade the plan at "
-                    "https://dashboard.scrape.do, or clear the Scrape.do key in Settings to use the "
-                    "built-in browser fallback instead. (Running now would flag every attribute as "
-                    "unverifiable.)"
+            if remaining == 0 or not is_active:
+                plan_exhausted = True
+                log(
+                    f"⚠️  Scrape.do plan exhausted ({remaining}/{acct.get('MaxMonthlyRequest')} remaining). "
+                    "Activating moat-cache-first mode: URLs already scraped will be retrieved for free; "
+                    "any URL not in the Scrape.do cache will fall back to the built-in Playwright browser."
                 )
+                # Playwright is needed for the fallback path
+                playwright_pool = PlaywrightPool()
+    if not scrape_do_key:
+        playwright_pool = PlaywrightPool()
 
     def fetch_and_cache_html(url, index):
         h = url_hash(url)
@@ -479,8 +575,15 @@ def run_fetch_phase(
             return existing
 
         if scrape_do_key:
-            result = fetch_html_scrape_do(url, scrape_do_key)
-            method = "scrape_do"
+            # Cache-first: try moat (free), then live scrape (if credits remain),
+            # then fall back to Playwright (if plan exhausted and not in cache).
+            result, method = fetch_html_with_moat_fallback(
+                url, scrape_do_key, plan_exhausted=plan_exhausted
+            )
+            if result.status != "ok" and plan_exhausted and playwright_pool is not None:
+                # Moat cache miss + plan exhausted → headless browser
+                result = playwright_pool.fetch_html(url)
+                method = "playwright_fallback"
         else:
             result = playwright_pool.fetch_html(url)
             method = "playwright"
@@ -504,9 +607,14 @@ def run_fetch_phase(
         if existing is not None and not _is_retryable(existing):
             return existing
 
-        if scrape_do_key:
+        if scrape_do_key and not plan_exhausted:
+            # Live scrape (credits available)
             result = fetch_doc_scrape_do(url, scrape_do_key)
             method = "scrape_do"
+        elif scrape_do_key and plan_exhausted and playwright_pool is not None:
+            # Plan exhausted → fall back to Playwright for documents
+            result = playwright_pool.fetch_doc(url)
+            method = "playwright_fallback"
         else:
             result = playwright_pool.fetch_doc(url)
             method = "playwright"
@@ -570,9 +678,15 @@ def run_fetch_phase(
                 f"Section/Label/Value/UOM/Flag block) - detected columns were: {names}"
             )
 
+        if scrape_do_key and plan_exhausted:
+            fetch_method_label = "Scrape.do moat cache + Playwright fallback (plan exhausted)"
+        elif scrape_do_key:
+            fetch_method_label = "Scrape.do (moat cache-first, then live)"
+        else:
+            fetch_method_label = "Playwright (no Scrape.do key supplied)"
         log(f"Detected columns: part_no='{names[schema['part_no_idx']]}', "
             f"{len(schema['html_idx'])} HTML source col(s), {len(schema['doc_idx'])} document col(s) "
-            f"(fetch method: {'Scrape.do' if scrape_do_key else 'Playwright (no key supplied)'})")
+            f"(fetch method: {fetch_method_label})")
 
         header_len = len(names)
 
@@ -722,3 +836,4 @@ def run_fetch_phase(
     finally:
         if playwright_pool is not None:
             playwright_pool.close()
+            playwright_pool = None
