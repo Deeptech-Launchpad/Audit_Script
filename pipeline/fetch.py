@@ -6,12 +6,11 @@ same approach as the original CLI scripts, kept deliberately simple (no
 database) since this app runs as a single process for one team/user.
 
 Three fetch strategies, applied in priority order:
-  1. Scrape.do dedupe/moat cache  (zero credits consumed)
-       GET /moat/scraped?url=<url>              → check if already scraped
-       GET /moat/scraped/content?url=<url>      → retrieve cached text
-     Used first whenever a Scrape.do key is provided, regardless of whether
-     the plan still has live-scraping credits.  If the URL was previously
-     scraped by ANY job on the account it lands here for free.
+  1. Moat scraped-URL store  (no Scrape.do credits; needs MOAT_BASE_URL and
+     MOAT_API_KEY env vars, sent as the X-API-Key header)
+       GET /moat/scraped?url=<url>              → {scraped, type, ...}
+       GET /moat/scraped/content?url=<url>      → {"text": ...}, 404 if not scraped
+     Tried first for every HTML URL when configured.
   2. Scrape.do live proxy  (consumes credits, only if plan has remaining)
      proxy-based HTTP fetch, handles anti-bot-protected sites.
   3. Playwright fallback  (no key required, or when plan is exhausted)
@@ -169,96 +168,6 @@ def pdf_pages(raw_path: str, lo: int, hi: int, timeout: int = 60) -> dict:
 # ---------------------------------------------------------------- Scrape.do
 
 SCRAPE_DO_API_BASE = "https://api.scrape.do"
-SCRAPE_DO_MOAT_BASE = "https://api.scrape.do"  # same base; /moat/* endpoints live here
-
-
-def _bounded_get(url, timeout, **kwargs):
-    fut = _net_executor.submit(requests.get, url, timeout=timeout, **kwargs)
-    return fut.result(timeout=timeout + 10)
-
-
-def _scrape_do_url(url: str, token: str) -> str:
-    return f"{SCRAPE_DO_API_BASE}/?token={token}&url={urllib.parse.quote(url, safe='')}"
-
-
-# ---- Scrape.do dedupe / moat cache helpers (zero-credit lookups) ----
-
-def scrape_do_is_cached(url: str, token: str, timeout: int = 15) -> bool:
-    """Returns True if Scrape.do's moat store already has this URL scraped.
-    Uses GET /moat/scraped?url=<url> with X-API-Key header.
-    Never raises; any error is treated as "not cached"."""
-    try:
-        endpoint = f"{SCRAPE_DO_MOAT_BASE}/moat/scraped"
-        r = _bounded_get(
-            endpoint,
-            timeout=timeout,
-            params={"url": url},
-            headers={"X-API-Key": token},
-        )
-        if r.status_code == 200:
-            data = r.json()
-            return bool(data.get("scraped"))
-        return False
-    except Exception:
-        return False
-
-
-def scrape_do_get_cached_text(url: str, token: str, timeout: int = 30) -> HtmlResult:
-    """Fetches already-scraped text from Scrape.do's moat cache.
-    Uses GET /moat/scraped/content?url=<url> with X-API-Key header.
-    Returns HtmlResult(status='ok') on success, HtmlResult(status='error') otherwise.
-    Consumes ZERO scraping credits."""
-    try:
-        endpoint = f"{SCRAPE_DO_MOAT_BASE}/moat/scraped/content"
-        r = _bounded_get(
-            endpoint,
-            timeout=timeout,
-            params={"url": url},
-            headers={"X-API-Key": token},
-        )
-        if r.status_code == 404:
-            return HtmlResult(status="error", error="URL not in Scrape.do cache (404)")
-        if r.status_code == 200:
-            raw = r.text or ""
-            # The /moat/scraped/content endpoint returns the raw HTML/text
-            # that was captured at scrape time.  Strip HTML tags if present.
-            if raw.lstrip().startswith("<"):
-                text = extract_text_from_html(raw)
-            else:
-                text = raw
-            if len(text) > 50:
-                return HtmlResult(status="ok", text=text)
-            return HtmlResult(status="error", error="Cached content too short to be useful")
-        return HtmlResult(status="error", error=f"Moat cache HTTP {r.status_code}")
-    except Exception as e:
-        return HtmlResult(status="error", error=f"Moat cache fetch error: {e}")
-
-
-def fetch_html_with_moat_fallback(
-    url: str,
-    token: str,
-    plan_exhausted: bool = False,
-    log=None,
-) -> tuple[HtmlResult, str]:
-    """Cache-first HTML fetch strategy:
-      1. Try Scrape.do moat cache (free, no credits).
-      2. If not cached and plan has credits → live Scrape.do proxy.
-      3. If not cached and plan exhausted → return error (caller falls back to Playwright).
-    Returns (HtmlResult, method_label)."""
-    # Step 1: check moat cache
-    cached_result = scrape_do_get_cached_text(url, token)
-    if cached_result.status == "ok":
-        return cached_result, "scrape_do_moat_cache"
-
-    if plan_exhausted:
-        return HtmlResult(
-            status="error",
-            error="Scrape.do plan exhausted and URL not in moat cache — falling back to Playwright",
-        ), "scrape_do_moat_cache"
-
-    # Step 2: live scrape
-    result = fetch_html_scrape_do(url, token)
-    return result, "scrape_do_live"
 
 
 @dataclass
@@ -273,6 +182,69 @@ class DocResult:
     status: str  # ok | error
     content: bytes | None = None
     error: str | None = None
+
+
+def _bounded_get(url, timeout, **kwargs):
+    fut = _net_executor.submit(requests.get, url, timeout=timeout, **kwargs)
+    return fut.result(timeout=timeout + 10)
+
+
+def _scrape_do_url(url: str, token: str) -> str:
+    return f"{SCRAPE_DO_API_BASE}/?token={token}&url={urllib.parse.quote(url, safe='')}"
+
+
+# ---- Scrape.do dedupe / moat cache helpers (zero-credit lookups) ----
+
+def moat_config() -> tuple[str, str] | None:
+    """(base_url, api_key) of the Moat scraped-URL store, from the MOAT_BASE_URL
+    and MOAT_API_KEY environment variables. None if either is unset."""
+    base = (os.environ.get("MOAT_BASE_URL") or "").strip().rstrip("/")
+    key = (os.environ.get("MOAT_API_KEY") or "").strip()
+    return (base, key) if base and key else None
+
+
+def moat_is_scraped(url: str, timeout: int = 15) -> bool:
+    """GET /moat/scraped?url=<url> -> {scraped: bool, ...}. Never raises; any
+    error counts as "not scraped"."""
+    cfg = moat_config()
+    if not cfg:
+        return False
+    base, key = cfg
+    try:
+        r = _bounded_get(f"{base}/moat/scraped", timeout=timeout,
+                         params={"url": url}, headers={"X-API-Key": key})
+        return r.status_code == 200 and bool(r.json().get("scraped"))
+    except Exception:
+        return False
+
+
+def moat_get_cached_text(url: str, timeout: int = 30) -> HtmlResult:
+    """GET /moat/scraped/content?url=<url> -> {"text": ...} (404 if not scraped
+    yet). Uses no Scrape.do credits."""
+    cfg = moat_config()
+    if not cfg:
+        return HtmlResult(status="error", error="Moat not configured")
+    base, key = cfg
+    try:
+        r = _bounded_get(f"{base}/moat/scraped/content", timeout=timeout,
+                         params={"url": url}, headers={"X-API-Key": key})
+        if r.status_code == 404:
+            return HtmlResult(status="error", error="URL not in Moat store (404)")
+        if r.status_code != 200:
+            return HtmlResult(status="error", error=f"Moat HTTP {r.status_code}")
+        try:
+            payload = r.json()
+            text = payload.get("text") if isinstance(payload, dict) else None
+        except ValueError:
+            text = r.text
+        text = text or ""
+        if text.lstrip().startswith("<"):
+            text = extract_text_from_html(text)
+        if len(text) > 50:
+            return HtmlResult(status="ok", text=text)
+        return HtmlResult(status="error", error="Moat content too short to be useful")
+    except Exception as e:
+        return HtmlResult(status="error", error=f"Moat fetch error: {e}")
 
 
 def scrape_do_account(token: str, timeout: int = 20) -> dict | None:
@@ -574,19 +546,17 @@ def run_fetch_phase(
         if existing is not None and not _is_retryable(existing):
             return existing
 
-        if scrape_do_key:
-            # Cache-first: try moat (free), then live scrape (if credits remain),
-            # then fall back to Playwright (if plan exhausted and not in cache).
-            result, method = fetch_html_with_moat_fallback(
-                url, scrape_do_key, plan_exhausted=plan_exhausted
-            )
-            if result.status != "ok" and plan_exhausted and playwright_pool is not None:
-                # Moat cache miss + plan exhausted → headless browser
+        # Cache-first: Moat store (free), then live Scrape.do (if key + credits),
+        # then Playwright.
+        result, method = None, None
+        if moat_config():
+            result, method = moat_get_cached_text(url), "moat_cache"
+        if result is None or result.status != "ok":
+            if scrape_do_key and not plan_exhausted:
+                result, method = fetch_html_scrape_do(url, scrape_do_key), "scrape_do"
+            else:
                 result = playwright_pool.fetch_html(url)
-                method = "playwright_fallback"
-        else:
-            result = playwright_pool.fetch_html(url)
-            method = "playwright"
+                method = "playwright"
 
         if result.status == "ok":
             text_path = os.path.join(_cache_html_dir(cache_dir), h + ".txt")
@@ -678,12 +648,13 @@ def run_fetch_phase(
                 f"Section/Label/Value/UOM/Flag block) - detected columns were: {names}"
             )
 
+        moat_prefix = "Moat cache -> " if moat_config() else ""
         if scrape_do_key and plan_exhausted:
-            fetch_method_label = "Scrape.do moat cache + Playwright fallback (plan exhausted)"
+            fetch_method_label = moat_prefix + "Playwright (Scrape.do plan exhausted)"
         elif scrape_do_key:
-            fetch_method_label = "Scrape.do (moat cache-first, then live)"
+            fetch_method_label = moat_prefix + "Scrape.do"
         else:
-            fetch_method_label = "Playwright (no Scrape.do key supplied)"
+            fetch_method_label = moat_prefix + "Playwright (no Scrape.do key supplied)"
         log(f"Detected columns: part_no='{names[schema['part_no_idx']]}', "
             f"{len(schema['html_idx'])} HTML source col(s), {len(schema['doc_idx'])} document col(s) "
             f"(fetch method: {fetch_method_label})")
