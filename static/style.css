@@ -644,6 +644,27 @@ button:disabled {
 
 .button.secondary:hover { background: color-mix(in srgb, var(--primary) 18%, var(--primary-soft)); box-shadow: none; }
 
+/* Dark mode: --primary-dark on --primary-soft is too low-contrast, so the
+   button read as disabled even when it was clickable. */
+@media (prefers-color-scheme: dark) {
+  .button.secondary {
+    color: #c7d2fe;
+    border: 1px solid color-mix(in srgb, var(--primary) 55%, transparent);
+  }
+}
+
+/* Must come after .button.secondary (same specificity wins by order) - a
+   disabled secondary button used to look identical to an enabled one. */
+button.button.secondary:disabled {
+  background: var(--border-strong);
+  color: var(--muted);
+  border-color: transparent;
+  opacity: 0.55;
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+}
+
 .button-row { display: flex; gap: 12px; flex-wrap: wrap; }
 
 /* ==========================================================================
