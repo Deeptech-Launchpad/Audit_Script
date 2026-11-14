@@ -410,6 +410,41 @@ def _run_pilot_revision(job_id: str) -> None:
             _save_job_meta(job)
 
 
+class FullRunRequest(BaseModel):
+    sheet: str
+    scrape_do_key: str | None = None
+    gemini_key: str
+
+
+@app.post("/api/jobs/{job_id}/full")
+def start_full_without_pilot(job_id: str, body: FullRunRequest):
+    """Skips the pilot/approval step and audits every product in one go -
+    for files the user already trusts the rules on. Same full-run path the
+    approve button uses, just entered straight from "uploaded"."""
+    with _jobs_lock:
+        job = JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(404, "Job not found")
+        if job["status"] != "uploaded":
+            raise HTTPException(400, f"Job already started (status={job['status']})")
+        if _run_lock.locked():
+            raise HTTPException(409, "Another run is already in progress - please wait for it to finish")
+
+        _check_schema_or_400(job["upload_path"], body.sheet)
+
+        job["sheet"] = body.sheet
+        job["_gemini_key"] = body.gemini_key
+        job["_scrape_do_key"] = body.scrape_do_key or None
+        job["status"] = "full_running"
+
+    save_settings(body.scrape_do_key or None, body.gemini_key)
+    _save_job_meta(job)
+    _log(job_id, "Starting full audit directly (pilot skipped)")
+
+    threading.Thread(target=_run_full, args=(job_id,), daemon=True).start()
+    return {"status": "started"}
+
+
 @app.post("/api/jobs/{job_id}/approve")
 def approve(job_id: str):
     with _jobs_lock:

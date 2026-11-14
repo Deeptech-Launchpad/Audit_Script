@@ -267,6 +267,7 @@ el("upload-btn").addEventListener("click", async () => {
 function updateStartPilotState() {
   const hasKey = el("gemini-key").value.trim().length > 0;
   el("start-pilot-btn").disabled = !hasKey;
+  el("start-full-btn").disabled = !hasKey;
   el("gemini-key").classList.toggle("field-missing", !hasKey);
 }
 
@@ -296,6 +297,36 @@ el("start-pilot-btn").addEventListener("click", async () => {
     return;
   }
   el("progress-title").textContent = "Running pilot...";
+  el("log-box").textContent = "";
+  show("progress");
+  startPolling();
+});
+
+el("start-full-btn").addEventListener("click", async () => {
+  const geminiKey = el("gemini-key").value.trim();
+  if (!geminiKey) {
+    updateStartPilotState();
+    el("gemini-key").focus();
+    return;
+  }
+  if (!confirm("Run the full audit on every product now, without a pilot review first?")) return;
+
+  el("start-full-btn").disabled = true;
+  const res = await fetch(`/api/jobs/${jobId}/full`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sheet: el("sheet-select").value,
+      scrape_do_key: el("scrape-do-key").value.trim() || null,
+      gemini_key: geminiKey,
+    }),
+  });
+  if (!res.ok) {
+    alert((await res.json()).detail || "Could not start full audit");
+    updateStartPilotState();
+    return;
+  }
+  el("progress-title").textContent = "Running full batch...";
   el("log-box").textContent = "";
   show("progress");
   startPolling();

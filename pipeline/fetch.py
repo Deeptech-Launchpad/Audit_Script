@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 import requests
+from requests.adapters import HTTPAdapter
 
 if sys.platform == "win32":
     # Playwright's sync API needs asyncio subprocess support (to spawn the
@@ -51,10 +52,18 @@ from pipeline.schema import detect_schema
 # Scrape.do enforces a per-plan concurrent-request cap (5 on the entry plans).
 # This used to be 8, which guaranteed a steady stream of HTTP 429s and read
 # timeouts no matter how healthy the account was. run_fetch_phase() lowers it
-# further at runtime if the account reports a smaller cap.
+# further at runtime if the account reports a smaller cap. It is enforced with
+# a semaphore around Scrape.do calls ONLY - it no longer throttles the whole
+# fetch phase.
 FETCH_WORKERS = 5
-PDF_PARSE_CONCURRENCY = 4
+# Overall fetch concurrency. Most URLs never touch Scrape.do (Moat cache hits,
+# direct document downloads), so they shouldn't queue behind its cap.
+NETWORK_WORKERS = 16
+PDF_PARSE_CONCURRENCY = max(4, min(8, os.cpu_count() or 4))
 PLAYWRIGHT_CONCURRENCY = 5
+# Scrape.do/target statuses worth retrying; any other 4xx is a permanent answer
+# for this URL (e.g. a 404 product page) and retrying only burns minutes.
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 PDF_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_worker.py")
 
@@ -184,8 +193,25 @@ class DocResult:
     error: str | None = None
 
 
+_session_local = threading.local()
+
+
+def _session() -> requests.Session:
+    """One pooled Session per network thread - reuses TCP/TLS connections to
+    the same host (Moat, Scrape.do, a vendor's CDN) instead of a fresh
+    handshake on every request, which plain requests.get() does."""
+    s = getattr(_session_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        _session_local.session = s
+    return s
+
+
 def _bounded_get(url, timeout, **kwargs):
-    fut = _net_executor.submit(requests.get, url, timeout=timeout, **kwargs)
+    fut = _net_executor.submit(lambda: _session().get(url, timeout=timeout, **kwargs))
     return fut.result(timeout=timeout + 10)
 
 
@@ -259,7 +285,7 @@ def scrape_do_account(token: str, timeout: int = 20) -> dict | None:
     return None
 
 
-def fetch_html_scrape_do(url: str, token: str, retries: int = 4, timeout: int = 60) -> HtmlResult:
+def fetch_html_scrape_do(url: str, token: str, retries: int = 2, timeout: int = 60) -> HtmlResult:
     last_err = None
     api_url = _scrape_do_url(url, token)
     for attempt in range(retries + 1):
@@ -275,6 +301,9 @@ def fetch_html_scrape_do(url: str, token: str, retries: int = 4, timeout: int = 
             if r.status_code == 429:
                 time.sleep(6 * (attempt + 1))
                 continue
+            if r.status_code != 200 and r.status_code not in _RETRYABLE_STATUS:
+                # e.g. 404/403/410 from the target page - a permanent answer.
+                return HtmlResult(status="error", error=last_err)
         except Exception as e:
             last_err = str(e)
             time.sleep(3 * (attempt + 1))  # back off on timeouts too, not just 429s
@@ -295,33 +324,59 @@ def _scrape_do_reason(response) -> str:
     return "check the Scrape.do dashboard"
 
 
-def fetch_doc_scrape_do(url: str, token: str, timeout: int = 30) -> DocResult:
-    """Direct HTTP GET first; Scrape.do proxy only as a fallback (handles
-    anti-bot-blocked hosts) - most documents succeed on the direct attempt."""
-    last_err = None
+_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+def _looks_like_document(response) -> bool:
+    """A 200 that is really an HTML page (login wall, cookie interstitial,
+    "file moved" landing page) must not be accepted as the document - it
+    would be cached as permanently "unextractable" and never retried."""
+    if response.content[:4] == b"%PDF":
+        return True
+    ct = (response.headers.get("content-type") or "").lower()
+    return "text/html" not in ct
+
+
+def fetch_doc_direct(url: str, timeout: int = 30) -> DocResult:
+    """Plain HTTP download - no credits, no browser. Most datasheet/PDF links
+    are static files on a CDN, so this alone succeeds for the majority."""
     try:
-        r = _bounded_get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        r = _bounded_get(url, timeout=timeout, headers={"User-Agent": _BROWSER_UA})
+        if r.status_code == 200 and len(r.content) > 100 and _looks_like_document(r):
+            return DocResult(status="ok", content=r.content)
+        if r.status_code == 200:
+            return DocResult(status="error", error="direct download returned an HTML page, not a document")
+        return DocResult(status="error", error=f"HTTP {r.status_code}")
+    except Exception as e:
+        return DocResult(status="error", error=str(e))
+
+
+def fetch_doc_via_scrape_do(url: str, token: str, timeout: int = 60) -> DocResult:
+    """Scrape.do proxy for documents on anti-bot-protected hosts."""
+    try:
+        r = _bounded_get(_scrape_do_url(url, token), timeout=timeout)
         if r.status_code == 200 and len(r.content) > 100:
             return DocResult(status="ok", content=r.content)
-        last_err = f"HTTP {r.status_code}"
+        if r.status_code == 401:
+            return DocResult(status="error", error=f"scrape.do HTTP 401 ({_scrape_do_reason(r)})")
+        return DocResult(status="error", error=f"scrape.do HTTP {r.status_code}")
     except Exception as e:
-        last_err = str(e)
-
-    try:
-        api_url = _scrape_do_url(url, token)
-        r = _bounded_get(api_url, timeout=timeout * 2)
-        if r.status_code == 200 and len(r.content) > 100:
-            return DocResult(status="ok", content=r.content)
-        last_err = f"scrape.do HTTP {r.status_code}"
-    except Exception as e:
-        last_err = str(e)
-
-    return DocResult(status="error", error=last_err)
+        return DocResult(status="error", error=str(e))
 
 
 # ---------------------------------------------------------------- Playwright
 
 _RECYCLE_EVERY = 200
+# Only the page's HTML/text is used - never download images, video, or fonts.
+_BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+
+
+def _block_heavy_resources(route):
+    if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
+        route.abort()
+    else:
+        route.continue_()
 
 
 class _ThreadState:
@@ -342,6 +397,12 @@ class PlaywrightPool:
         self.headless = headless
         self._executor = ThreadPoolExecutor(max_workers=size, thread_name_prefix="pw-fetch")
         self._local = threading.local()
+        # Callers wait here for a free browser BEFORE the hard timeout clock
+        # starts - otherwise a URL queued behind 5 slow pages would "time
+        # out" without ever having been tried.
+        self._slots = threading.Semaphore(size)
+        self._states: list[_ThreadState] = []
+        self._states_lock = threading.Lock()
 
     def _get_context(self):
         from playwright.sync_api import sync_playwright
@@ -353,25 +414,35 @@ class PlaywrightPool:
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (compatible; AuditBot/1.0)", accept_downloads=True,
             )
+            context.route("**/*", _block_heavy_resources)
             state = _ThreadState()
             state.playwright_ctx = pw
             state.browser = browser
             state.context = context
             self._local.state = state
+            with self._states_lock:
+                self._states.append(state)
         return state
+
+    @staticmethod
+    def _close_state(state):
+        try:
+            if state.context:
+                state.context.close()
+            if state.browser:
+                state.browser.close()
+            if state.playwright_ctx:
+                state.playwright_ctx.stop()
+        except Exception:
+            pass
 
     def _teardown_thread_state(self):
         state = getattr(self._local, "state", None)
         if state is not None:
-            try:
-                if state.context:
-                    state.context.close()
-                if state.browser:
-                    state.browser.close()
-                if state.playwright_ctx:
-                    state.playwright_ctx.stop()
-            except Exception:
-                pass
+            self._close_state(state)
+            with self._states_lock:
+                if state in self._states:
+                    self._states.remove(state)
             self._local.state = None
 
     def _fetch_html_worker(self, url: str) -> HtmlResult:
@@ -457,27 +528,51 @@ class PlaywrightPool:
                 page.close()
 
     def fetch_html(self, url: str, hard_timeout: float = 40.0) -> HtmlResult:
-        future = self._executor.submit(self._fetch_html_worker, url)
-        try:
-            return future.result(timeout=hard_timeout)
-        except TimeoutError:
-            return HtmlResult(status="error", error=f"playwright hard timeout after {hard_timeout}s")
-        except Exception as e:
-            # Defense in depth: _fetch_html_worker should always return a
-            # Result rather than raise, but a crash here must still fail
-            # only this one fetch, never the whole run.
-            return HtmlResult(status="error", error=str(e) or type(e).__name__)
+        with self._slots:
+            future = self._executor.submit(self._fetch_html_worker, url)
+            try:
+                return future.result(timeout=hard_timeout)
+            except TimeoutError:
+                return HtmlResult(status="error", error=f"playwright hard timeout after {hard_timeout}s")
+            except Exception as e:
+                # Defense in depth: _fetch_html_worker should always return a
+                # Result rather than raise, but a crash here must still fail
+                # only this one fetch, never the whole run.
+                return HtmlResult(status="error", error=str(e) or type(e).__name__)
 
     def fetch_doc(self, url: str, hard_timeout: float = 40.0) -> DocResult:
-        future = self._executor.submit(self._fetch_doc_worker, url)
-        try:
-            return future.result(timeout=hard_timeout)
-        except TimeoutError:
-            return DocResult(status="error", error=f"playwright hard timeout after {hard_timeout}s")
-        except Exception as e:
-            return DocResult(status="error", error=str(e) or type(e).__name__)
+        with self._slots:
+            future = self._executor.submit(self._fetch_doc_worker, url)
+            try:
+                return future.result(timeout=hard_timeout)
+            except TimeoutError:
+                return DocResult(status="error", error=f"playwright hard timeout after {hard_timeout}s")
+            except Exception as e:
+                return DocResult(status="error", error=str(e) or type(e).__name__)
 
     def close(self):
+        # Each browser belongs to the worker thread that started it (sync
+        # Playwright objects can't be used from another thread), so ask every
+        # worker to close its own. Previously nothing closed them and every
+        # run left up to `size` Chromium processes behind on the server.
+        # The barrier holds each task until all `size` are running, which
+        # forces them onto `size` DIFFERENT threads (a thread parked in
+        # wait() can't pick up a second task) - one teardown per browser.
+        barrier = threading.Barrier(self.size)
+
+        def _close_own():
+            self._teardown_thread_state()
+            try:
+                barrier.wait(timeout=10)
+            except threading.BrokenBarrierError:
+                pass  # a worker stuck on a hung page - can't reach its browser
+
+        futures = [self._executor.submit(_close_own) for _ in range(self.size)]
+        for f in futures:
+            try:
+                f.result(timeout=15)
+            except Exception:
+                pass
         self._executor.shutdown(wait=False, cancel_futures=True)
 
 
@@ -539,6 +634,10 @@ def run_fetch_phase(
     if not scrape_do_key:
         playwright_pool = PlaywrightPool()
 
+    # The plan's concurrency cap applies to Scrape.do calls only; Moat lookups
+    # and direct downloads run alongside at full NETWORK_WORKERS width.
+    scrape_slots = threading.BoundedSemaphore(fetch_workers)
+
     def fetch_and_cache_html(url, index):
         h = url_hash(url)
         with _index_lock:
@@ -553,7 +652,8 @@ def run_fetch_phase(
             result, method = moat_get_cached_text(url), "moat_cache"
         if result is None or result.status != "ok":
             if scrape_do_key and not plan_exhausted:
-                result, method = fetch_html_scrape_do(url, scrape_do_key), "scrape_do"
+                with scrape_slots:
+                    result, method = fetch_html_scrape_do(url, scrape_do_key), "scrape_do"
             else:
                 result = playwright_pool.fetch_html(url)
                 method = "playwright"
@@ -577,17 +677,19 @@ def run_fetch_phase(
         if existing is not None and not _is_retryable(existing):
             return existing
 
-        if scrape_do_key and not plan_exhausted:
-            # Live scrape (credits available)
-            result = fetch_doc_scrape_do(url, scrape_do_key)
-            method = "scrape_do"
-        elif scrape_do_key and plan_exhausted and playwright_pool is not None:
-            # Plan exhausted → fall back to Playwright for documents
-            result = playwright_pool.fetch_doc(url)
-            method = "playwright_fallback"
-        else:
-            result = playwright_pool.fetch_doc(url)
-            method = "playwright"
+        # Cheapest first: plain download (free, fast - most datasheets are
+        # static files), then Scrape.do (credits), then a headless browser.
+        result, method = fetch_doc_direct(url), "direct"
+        if result.status != "ok":
+            direct_err = result.error
+            if scrape_do_key and not plan_exhausted:
+                with scrape_slots:
+                    result, method = fetch_doc_via_scrape_do(url, scrape_do_key), "scrape_do"
+            elif playwright_pool is not None:
+                result = playwright_pool.fetch_doc(url)
+                method = "playwright_fallback" if scrape_do_key else "playwright"
+            if result.status != "ok":
+                result.error = f"{result.error} (direct download: {direct_err})"
 
         if result.status != "ok" or not result.content:
             meta = {"url": url, "status": "error", "error": result.error, "text_path": None,
@@ -712,12 +814,21 @@ def run_fetch_phase(
             f"{len(doc_urls)} unique document URLs ({len(doc_todo)} to fetch, {retry_doc} retrying past failures)")
 
         done = {"n": 0}
+        done_lock = threading.Lock()
         total_todo = len(html_todo) + len(doc_todo)
+        started = time.monotonic()
 
         def _progress_tick():
-            done["n"] += 1
-            if total_todo and done["n"] % 25 == 0:
-                log(f"Fetched {done['n']}/{total_todo}")
+            with done_lock:
+                done["n"] += 1
+                n = done["n"]
+            if total_todo and n % 25 == 0:
+                rate = n / max(1e-6, time.monotonic() - started)
+                log(f"Fetched {n}/{total_todo} ({rate * 60:.0f} URLs/min)")
+            if n % 200 == 0:
+                # Checkpoint, so a crash/restart mid-run keeps what's fetched.
+                with _index_lock:
+                    save_index(cache_dir, index)
 
         def _html_task(url):
             try:
@@ -748,16 +859,15 @@ def run_fetch_phase(
                     }
             _progress_tick()
 
-        with ThreadPoolExecutor(max_workers=fetch_workers) as ex:
-            futures = [ex.submit(_html_task, u) for u in html_todo]
-            for fut in as_completed(futures):
-                fut.result()
-        save_index(cache_dir, index)
-
-        with ThreadPoolExecutor(max_workers=fetch_workers) as ex:
+        # HTML pages and documents in ONE pool, concurrently - documents used
+        # to wait for every HTML page to finish first. Scrape.do and the
+        # browser are still capped by their own semaphores inside.
+        with ThreadPoolExecutor(max_workers=NETWORK_WORKERS) as ex:
             futures = [ex.submit(_doc_task, u) for u in doc_todo]
+            futures += [ex.submit(_html_task, u) for u in html_todo]
             for fut in as_completed(futures):
                 fut.result()
+        log(f"Fetch finished in {time.monotonic() - started:.0f}s")
         save_index(cache_dir, index)
 
         for part in seen_parts:
