@@ -16,7 +16,14 @@ import requests
 
 from pipeline.fetch import pdf_pages
 
-VALIDATE_WORKERS = 4
+# Concurrent Gemini calls. Override with the VALIDATE_WORKERS env var (lower it
+# if the log shows HTTP 429s - that means the key's rate limit is the ceiling).
+VALIDATE_WORKERS = int(os.environ.get("VALIDATE_WORKERS") or 6)
+# A product's attribute rows are sent to Gemini in slices of about this many
+# rows, in parallel, instead of one call per product. Generating ~50 rows of
+# JSON is what takes the time, so a few products with many rows used to leave
+# most workers idle while one call ground through every row in sequence.
+ROWS_PER_CALL = 20
 MAX_CHARS_PER_SOURCE = 15000
 
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -91,7 +98,7 @@ Separately, use raw_value as ground truth for what unit THIS SPECIFIC attribute 
 
 Whether uom_recorded and uom_source actually differ (e.g. "A" and "Amp" are the same unit), and whether uom_recorded is even a real unit of measure at all when data_type is "number" (e.g. "ID"/"OD" are dimension qualifiers, not units, and are wrong for a number-type attribute regardless of raw_value), is all checked automatically after your response - just report what you literally find, verbatim, without judging validity or equivalence yourself.
 
-Respond with a JSON object matching the required schema, one entry per attribute row_idx you were given (do not skip any).
+Respond with a JSON object matching the required schema, one entry per attribute row_idx you were given (do not skip any). Keep "reasoning" to ONE short sentence (about 15 words or fewer) - it is only a debugging note, and long explanations just slow the response down.
 """
 
 _page_cache_lock = threading.Lock()
@@ -233,9 +240,12 @@ def build_prompt(manifest, texts, errors, cache_dir, extra_instructions=None):
     return "\n".join(lines)
 
 
-def call_gemini(prompt: str, gemini_key: str, retries: int = 3, temperature: float = 0) -> dict:
+def call_gemini(prompt: str, gemini_key: str, retries: int = 4, temperature: float = 0) -> dict:
+    # The key goes in a header, not the URL: requests puts the full URL into
+    # its exception text, which ends up in the job log and the output file.
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{GEMINI_MODEL}:generateContent?key={gemini_key}")
+           f"{GEMINI_MODEL}:generateContent")
+    headers = {"x-goog-api-key": gemini_key}
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -247,17 +257,23 @@ def call_gemini(prompt: str, gemini_key: str, retries: int = 3, temperature: flo
     }
     last_err = None
     for attempt in range(retries):
+        delay = 3 * (attempt + 1)
         try:
-            r = requests.post(url, json=body, timeout=120)
+            r = requests.post(url, json=body, headers=headers, timeout=120)
             if r.status_code == 200:
                 data = r.json()
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
                 return json.loads(text)
             last_err = f"HTTP {r.status_code}: {r.text[:300]}"
+            if r.status_code in (429, 500, 502, 503, 504):
+                delay = 8 * 2 ** attempt  # rate-limited/overloaded: back off properly (8s, 16s, 32s...)
+            elif r.status_code in (400, 401, 403, 404):
+                break  # bad key / bad request - retrying can't change the answer
         except Exception as e:
-            last_err = str(e)
-        time.sleep(3 * (attempt + 1))
-    raise RuntimeError(f"Gemini call failed after {retries} attempts: {last_err}")
+            last_err = str(e).replace(gemini_key, "***")
+        if attempt < retries - 1:
+            time.sleep(delay)
+    raise RuntimeError(f"Gemini call failed after {attempt + 1} attempt(s): {last_err}")
 
 
 def validate_result(result, manifest):
@@ -589,18 +605,17 @@ def _dedupe_uom_from_flag_text(item, orig_value):
         item["flag_text"] = "Value Correct"
 
 
-def _process_one(mpath, results_dir, gemini_key, cache_dir, log, extra_instructions=None):
-    part = os.path.splitext(os.path.basename(mpath))[0]
-    result_path = os.path.join(results_dir, f"{part}.json")
-    if os.path.exists(result_path):
-        return
+def _call_with_retries(label, manifest, texts, errors, gemini_key, cache_dir, log, extra_instructions, verbose):
+    """One structurally-valid Gemini response for `manifest` (a whole product,
+    or a slice of its rows). Returns (result, None) or (None, reason)."""
+    started = time.monotonic()
+    try:
+        prompt = build_prompt(manifest, texts, errors, cache_dir, extra_instructions)
+    except Exception as e:
+        log(f"{label}: could not build prompt: {e}")
+        return None, f"could not build prompt: {e}"
+    prompt_secs = time.monotonic() - started
 
-    with open(mpath, "r", encoding="utf-8") as f:
-        manifest = json.load(f)
-    texts, errors = gather_sources_text(manifest)
-    prompt = build_prompt(manifest, texts, errors, cache_dir, extra_instructions)
-
-    result = None
     last_err = None
     for attempt in range(3):
         # temperature=0 is deterministic - retrying identically after a bad
@@ -610,20 +625,69 @@ def _process_one(mpath, results_dir, gemini_key, cache_dir, log, extra_instructi
             candidate = call_gemini(prompt, gemini_key, temperature=temperature)
         except Exception as e:
             last_err = str(e)
+            log(f"{label}: Gemini call failed (attempt {attempt + 1}/3): {last_err[:200]}")
             continue
         problem = validate_result(candidate, manifest)
         if problem is None:
-            result = candidate
-            break
+            elapsed = time.monotonic() - started
+            # Always report slow calls (that's the thing worth knowing); report
+            # every call too on small runs so the first run explains itself.
+            if verbose or elapsed >= 60:
+                log(f"{label}: done in {elapsed:.0f}s (prompt {len(prompt) // 1000}k chars, "
+                    f"{prompt_secs:.0f}s building it, attempt {attempt + 1})")
+            return candidate, None
         last_err = f"response failed validation: {problem}"
-        log(f"{part}: retry (attempt {attempt + 1}): {last_err}")
+        log(f"{label}: retry (attempt {attempt + 1}): {last_err}")
 
-    if result is None:
-        log(f"{part}: giving up after retries - {last_err}")
+    log(f"{label}: giving up after retries - {last_err}")
+    return None, last_err
+
+
+def _row_slices(attributes):
+    """Splits a product's rows into the fewest slices of <= ROWS_PER_CALL,
+    sized evenly (52 rows -> 18+17+17, not 20+20+12)."""
+    n = len(attributes)
+    if n == 0:
+        return []
+    count = -(-n // ROWS_PER_CALL)
+    size = -(-n // count)
+    return [attributes[i:i + size] for i in range(0, n, size)]
+
+
+def _process_one(mpath, results_dir, chunk_pool, gemini_key, cache_dir, log, extra_instructions=None,
+                 verbose=True):
+    part = os.path.splitext(os.path.basename(mpath))[0]
+    result_path = os.path.join(results_dir, f"{part}.json")
+    if os.path.exists(result_path):
+        return
+
+    with open(mpath, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    texts, errors = gather_sources_text(manifest)
+
+    slices = _row_slices(manifest["attributes"])
+    futures, first = [], 0
+    for rows in slices:
+        label = part if len(slices) == 1 else f"{part} rows {first + 1}-{first + len(rows)}/{len(manifest['attributes'])}"
+        first += len(rows)
+        futures.append(chunk_pool.submit(
+            _call_with_retries, label, {**manifest, "attributes": rows}, texts, errors,
+            gemini_key, cache_dir, log, extra_instructions, verbose))
+
+    items, last_err = [], None
+    for fut in futures:
+        res, err = fut.result()
+        if res is None:
+            last_err = last_err or err
+        else:
+            items.extend(res.get("results", []))
+
+    if last_err is not None:
         result = {"error": last_err}
     else:
+        result = {"results": items}
         by_row = {a["row_idx"]: a for a in manifest["attributes"]}
-        for it in result.get("results", []):
+        for it in items:
             attr = by_row.get(it.get("row_idx")) or {}
             it["uom_comment"] = _resolve_uom_comment(
                 it, attr.get("data_type"), attr.get("allowed_values"), attr.get("definition"),
@@ -631,8 +695,12 @@ def _process_one(mpath, results_dir, gemini_key, cache_dir, log, extra_instructi
             _fix_unreadable_source_flag(it, manifest, attr)
             _dedupe_uom_from_flag_text(it, attr.get("attr_value"))
 
-    with open(result_path, "w", encoding="utf-8") as f:
+    # Write-then-rename: an existing result file means "done, skip", so a
+    # half-written one (crash mid-write) must never be visible.
+    tmp = result_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=1)
+    os.replace(tmp, result_path)
 
 
 def run_validate_phase(
@@ -646,19 +714,27 @@ def run_validate_phase(
         if product_filter(os.path.splitext(os.path.basename(mpath))[0], i)
     ]
 
-    log(f"Validating {len(selected)} product manifests with {VALIDATE_WORKERS} workers"
-        + (" (with user feedback applied)" if extra_instructions else ""))
+    log(f"Validating {len(selected)} product manifests, up to {VALIDATE_WORKERS} Gemini calls at once "
+        f"({ROWS_PER_CALL} rows per call)" + (" (with user feedback applied)" if extra_instructions else ""))
 
+    verbose = len(selected) <= 50  # per-call timing lines only when they won't flood the log
+    started = time.monotonic()
     done = {"n": 0}
-    with ThreadPoolExecutor(max_workers=VALIDATE_WORKERS) as ex:
+    # Two pools: product threads load/prepare a product and wait; chunk
+    # threads do the actual Gemini calls. They're separate so a product
+    # waiting on its slices can never occupy the thread a slice needs.
+    with ThreadPoolExecutor(max_workers=VALIDATE_WORKERS) as chunk_pool, \
+            ThreadPoolExecutor(max_workers=VALIDATE_WORKERS) as product_pool:
         futures = [
-            ex.submit(_process_one, mpath, results_dir, gemini_key, cache_dir, log, extra_instructions)
+            product_pool.submit(_process_one, mpath, results_dir, chunk_pool, gemini_key, cache_dir, log,
+                                extra_instructions, verbose)
             for mpath in selected
         ]
         for fut in as_completed(futures):
             fut.result()
             done["n"] += 1
-            if done["n"] % 10 == 0:
-                log(f"Validated {done['n']}/{len(selected)}")
+            if verbose or done["n"] % 10 == 0:
+                log(f"Validated {done['n']}/{len(selected)} products "
+                    f"({time.monotonic() - started:.0f}s elapsed)")
 
-    log("Validate phase complete")
+    log(f"Validate phase complete in {time.monotonic() - started:.0f}s")
